@@ -9,8 +9,8 @@ from .. import loader, utils
 async def run_subprocess(command):
     process = await asyncio.create_subprocess_exec(
         *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
     )
     stdout, stderr = await process.communicate()
     return process.returncode, stdout.decode(), stderr.decode()
