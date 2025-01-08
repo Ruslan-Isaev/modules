@@ -47,7 +47,7 @@ def seq_rights(sequence: str, inv: bool = False) -> typing.Union[dict, None]:
 
 @loader.tds
 class AmnestyMod(loader.Module):
-    """Модуль для разбана всех пользователей в чате"""
+    """Модуль для разбана всех пользователей в чате (амнистия)."""
 
     strings = {
         "name": "Amnesty",
