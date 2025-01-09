@@ -8,6 +8,7 @@ import time
 from .. import loader, utils
 import typing
 from telethon.errors import ChatAdminRequiredError, UserAdminInvalidError
+from telethon.tl.functions.contacts import GetBlockedRequest, UnblockRequest
 
 def seq_rights(sequence: str, inv: bool = False) -> typing.Union[dict, None]:
     if not sequence:
@@ -45,9 +46,16 @@ def seq_rights(sequence: str, inv: bool = False) -> typing.Union[dict, None]:
 
     return result
 
+async def unblock_user(message, user_id, i, ids):
+    try:
+        await message.client(UnblockRequest(id=user_id))
+        await utils.answer(message, f"♻️ <b>Разбанено пользователей: {i + 1}/{int(len(ids))}</b>")
+    except Exception as e:
+        await utils.answer(message, f"🚫 <b> Ошибка! </b>\n\n<code>{e}</code>")
+
 @loader.tds
 class AmnestyMod(loader.Module):
-    """Модуль для разбана всех пользователей в чате (амнистия)."""
+    """Модуль для разбана всех пользователей в чате или в лс (амнистия)"""
 
     strings = {
         "name": "Amnesty",
@@ -55,7 +63,7 @@ class AmnestyMod(loader.Module):
         
     @loader.command()
     async def amnestycmd(self, message):
-        """ - разблокирует всех"""
+        """ - разблокирует всех в чате"""
         try:
         	chat_id = message.chat.id
         except:
@@ -64,6 +72,9 @@ class AmnestyMod(loader.Module):
         chat = await message.client.get_participants(chat_id, filter=ChannelParticipantsKicked)
         ids = [user.id for user in chat]
         i = 0
+        if len(ids) == 0:
+        	await utils.answer(message, "<b>Черный список чата уже пустой!</b>")
+        	return
         for id in ids:
         	try:
         		await self.client.edit_permissions(chat_id, id, None, **seq_rights('0'),)
@@ -74,6 +85,21 @@ class AmnestyMod(loader.Module):
         	except Exception as e:
         		return await utils.answer(message, "🚫 <b> Ошибка! </b>\n\n<code>{e}</code>")
         	await utils.answer(message, f"♻️ <b>Разбанено пользователей: {i + 1}/{int(len(ids))}</b>")
+        	i += 1
+        	time.sleep(1)
+        await utils.answer(message, f"✅ <b>Успешно! {int(len(ids))} пользователей разблокировано!</b>")
+        
+    @loader.command()
+    async def amnistiacmd(self, message):
+        """ - разблокирует всех в лс"""
+        chat = await message.client(GetBlockedRequest(offset=0, limit=500))
+        i = 0
+        ids = [user.id for user in chat.users]
+        if len(ids) == 0:
+        	await utils.answer(message, "<b>Черный список пустой!</b>")
+        	return
+        for id in ids:
+        	await unblock_user(message, id, i, ids)
         	i += 1
         	time.sleep(1)
         await utils.answer(message, f"✅ <b>Успешно! {int(len(ids))} пользователей разблокировано!</b>")
