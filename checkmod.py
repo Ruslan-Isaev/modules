@@ -1,3 +1,6 @@
+# This program is free software; you can redistribute it and/or modify
+# Copyleft 2022 t.me/vsecoder
+
 import contextlib
 import logging
 import re
