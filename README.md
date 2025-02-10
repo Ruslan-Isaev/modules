@@ -1,1 +1,1 @@
-![ruismods](https://i.imgur.com/9cOQ4mc.jpeg)
+![ruismods](https://i.imgur.com/pKbJrws.jpeg)
