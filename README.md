@@ -1,1 +1,1 @@
-![ruismods](https://i.imgur.com/pKbJrws.jpeg)
+![ruismods](https://raw.githubusercontent.com/Ruslan-Isaev/modules/refs/heads/main/photos/banner.jpg)
