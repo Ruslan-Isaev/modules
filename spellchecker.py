@@ -4,9 +4,9 @@ from telethon.tl.types import Message
 import aiohttp
 
 @loader.tds
-class SpellCheckerMod(loader.Module):
+class SpellerMod(loader.Module):
     strings = {
-        "name": "SpellChecker",
+        "name": "Speller",
         "no_text": "❌ <b>Укажите текст для проверки или используйте реплай.</b>",
         "no_reply": "❌ <b>Это не реплай на сообщение.</b>",
         "api_error": "❌ <b>Ошибка при обращении к API Яндекс.Спеллера.</b>"
