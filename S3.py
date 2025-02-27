@@ -1,4 +1,9 @@
-version = (1, 0, 0)
+version = (1, 1, 1)
+
+# changelog 1.1.0: убрана проверка хэш-суммы, сделано для избежания ошибок
+
+# changelog 1.1.1: изменен способ передачи файла, что бы избежать перерасход оперативной памяти
+
 
 # meta developer: @RUIS_VlP
 
@@ -8,19 +13,72 @@ import aiofiles
 import os
 from .. import loader, utils
 import mimetypes
+import botocore
+
+CHUNK_SIZE = 50 * 1024 * 1024  # 50MB
 
 async def s3_upload(url, bucket, filename, filepath, access_key, secret_key):
     session = aioboto3.Session()
-    mime_type, _ = mimetypes.guess_type(filename) #вычисление метаданных, нужно для того что бы браузер корректно определял загруженный в хранилище файл
+    
+    mime_type, _ = mimetypes.guess_type(filename)
     if mime_type is None:
-        mime_type = 'binary/octet-stream'
-    async with aiofiles.open(filename, 'rb') as f:
-            file_content = await f.read()
-            sha256_hash = hashlib.sha256(file_content).hexdigest() #вычисление хэша. обычно при загрузке он не нужен, но без него у меня бывают ошибки
+        mime_type = "binary/octet-stream"
 
-    async with session.client("s3", endpoint_url=url, aws_access_key_id=access_key, aws_secret_access_key=secret_key) as s3:
-    	await s3.upload_file(filename, bucket, f"{filepath}/{filename}", ExtraArgs={'ChecksumSHA256': sha256_hash, 'ContentType': mime_type})
-    	
+    async with session.client(
+        "s3",
+        endpoint_url=url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=botocore.config.Config(
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
+    ) as s3:
+        async with aiofiles.open(filename, "rb") as file:
+            upload_id = None
+            parts = []
+            part_number = 1
+
+            # Инициализируем многокомпонентную загрузку
+            response = await s3.create_multipart_upload(
+                Bucket=bucket,
+                Key=f"{filepath}/{filename}".replace(" ", "_"),
+                ContentType=mime_type
+            )
+            upload_id = response["UploadId"]
+
+            try:
+                while True:
+                    chunk = await file.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    
+                    response = await s3.upload_part(
+                        Bucket=bucket,
+                        Key=f"{filepath}/{filename}".replace(" ", "_"),
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=chunk
+                    )
+
+                    parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+                    part_number += 1
+
+                # Завершаем многокомпонентную загрузку
+                await s3.complete_multipart_upload(
+                    Bucket=bucket,
+                    Key=f"{filepath}/{filename}".replace(" ", "_"),
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                )
+            except Exception as e:
+                await s3.abort_multipart_upload(
+                    Bucket=bucket,
+                    Key=f"{filepath}/{filename}".replace(" ", "_"),
+                    UploadId=upload_id,
+                )
+                raise e
+
 async def s3_download(url, bucket, filename, filepath, access_key, secret_key):
     session = aioboto3.Session()
     async with session.client("s3", endpoint_url=url, aws_access_key_id=access_key, aws_secret_access_key=secret_key) as s3:
