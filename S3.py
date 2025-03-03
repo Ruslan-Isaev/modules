@@ -1,21 +1,128 @@
-version = (1, 1, 1)
+__version__ = (1, 2, 0)
 
 # changelog 1.1.0: убрана проверка хэш-суммы, сделано для избежания ошибок
 
 # changelog 1.1.1: изменен способ передачи файла, что бы избежать перерасход оперативной памяти
 
+# changelog 1.2.0: добавлены команды для переименования, вырезания, копирования файлов, просмотра занятого места, отмены незавершенных загрузок и полной очистки S3 хранилища
 
 # meta developer: @RUIS_VlP
 
 import aioboto3
-import hashlib
 import aiofiles
 import os
 from .. import loader, utils
 import mimetypes
 import botocore
+import asyncio
 
 CHUNK_SIZE = 50 * 1024 * 1024  # 50MB
+
+#полная очистка S3 хранилища
+async def s3_purge(url, bucket, access_key, secret_key):
+    session = aioboto3.Session()
+    async with session.client("s3", endpoint_url=url, aws_access_key_id=access_key, aws_secret_access_key=secret_key) as s3:
+    	response = await s3.list_objects_v2(Bucket=bucket, Prefix="")
+    	files = [obj["Key"] for obj in response.get("Contents", [])]
+    	async for file in files:
+    		await s3.delete_object(Bucket=bucket, Key=file)
+    	await s3_clear(url, bucket, access_key, secret_key)
+    	
+    
+#удаление незавершенных загрузок
+async def s3_clear(url, bucket, access_key, secret_key):
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    ) as s3:
+        deleted_count = 0
+
+        # Удаляем незавершённые загрузки
+        paginator = s3.get_paginator("list_multipart_uploads")
+        async for page in paginator.paginate(Bucket=bucket):
+            if "Uploads" in page:
+                for upload in page["Uploads"]:
+                    upload_id = upload["UploadId"]
+                    key = upload["Key"]
+
+                    # Прерываем незавершённые загрузки
+                    await s3.abort_multipart_upload(
+                        Bucket=bucket,
+                        Key=key,
+                        UploadId=upload_id
+                    )
+                    deleted_count += 1
+
+        # Проверка объектов, которые могут быть частично загружены
+        paginator = s3.get_paginator("list_objects_v2")
+        async for page in paginator.paginate(Bucket=bucket):
+            if "Contents" in page:
+                for obj in page["Contents"]:
+                    try:
+                        # Получаем размер объекта
+                        head_response = await s3.head_object(Bucket=bucket, Key=obj["Key"])
+                        # Если размер объекта на сервере меньше ожидаемого (ошибочная загрузка), удаляем его
+                        if head_response["ContentLength"] < obj["Size"]:
+                            await s3.delete_objects(
+                                Bucket=bucket,
+                                Delete={"Objects": [{"Key": obj["Key"]}]}
+                            )
+                            deleted_count += 1
+                    except Exception as e:
+                        pass  # Игнорируем ошибки, если они возникнут, например, из-за отсутствия доступа
+
+        return deleted_count
+
+#сколько памяти занято
+async def s3_usage(url, bucket, access_key, secret_key):
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    ) as s3:
+        total_size = 0
+
+        paginator = s3.get_paginator("list_objects_v2")
+        async for page in paginator.paginate(Bucket=bucket):
+            if "Contents" in page:
+                total_size += sum(obj["Size"] for obj in page["Contents"])
+
+        return total_size / (1024**3)  # Размер в ГБ
+
+#вырезать
+async def s3_cut(url, bucket, newkey, oldkey, access_key, secret_key):
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    ) as s3:
+        await s3.copy_object(
+            Bucket=bucket,
+            CopySource={'Bucket': bucket, 'Key': oldkey},
+            Key=newkey
+        )
+        await s3.delete_object(Bucket=bucket, Key=oldkey)
+        
+async def s3_copy(url, bucket, newkey, oldkey, access_key, secret_key):
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    ) as s3:
+        await s3.copy_object(
+            Bucket=bucket,
+            CopySource={'Bucket': bucket, 'Key': oldkey},
+            Key=newkey
+        )
 
 async def s3_upload(url, bucket, filename, filepath, access_key, secret_key):
     session = aioboto3.Session()
@@ -204,11 +311,128 @@ class S3Mod(loader.Module):
         	filepath = args
         	filepath = filepath[1:] if filepath.startswith('/') else filepath #удаление / из переменной, если она идет первым символом
         else:
-        	await utils.answer(message, "❌ <b>Вы не указали файл для удаления!")
+        	await utils.answer(message, "❌ <b>Вы не указали файл для удаления!</b>")
         	return
         try:
         	await s3_delete(url, bucket, filepath, access, secret)
         	await utils.answer(message, f"✅ <b>Файл</b> <code>{filepath}</code> <b>успешно удален!</b>")
+        except Exception as e:
+        	await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
+        	
+    @loader.command()
+    async def S3rename(self, message):
+        """<folder> <old_filename> <new_filename> - переименовывает файл. Пробелы в адресе заменяйте на %20"""
+        url = self.config["url"] or "None"
+        bucket = self.config["bucketname"] or "None"
+        access = self.config["access_key"] or "None"
+        secret = self.config["secret_key"] or "None"
+        if url == "None" or bucket == "None" or secret == "None" or access == "None":
+            await utils.answer(message, f"❌ <b>Вы не настроили модуль! Укажите необходимые данные в config. Команда: </b><code>{self.get_prefix()}config S3</code>")
+            return
+        args = utils.get_args_raw(message)
+        if args:
+        	keys = args.split(" ")
+        	if len(keys) == 3 or len(keys) > 3:
+        		key0 = keys[0]
+        		key0 = key0[1:] if key0.startswith('/') else key0
+        		key0 = key0.replace("%20", " ")
+        		
+        		key1 = keys[1]
+        		key1 = key1[1:] if key1.startswith('/') else key1
+        		key1 = key1.replace("%20", " ")
+        		
+        		key2 = keys[2]
+        		key2 = key2[1:] if key2.startswith('/') else key2
+        		key2 = key2.replace("%20", " ")
+        	else:
+        		await utils.answer(message, "❌ <b>Вы указали недостаточно аргументов!</b>")
+        		return
+        else:
+        	await utils.answer(message, "❌ <b>Вы не указали файл для переименования!</b>")
+        	return
+        try:
+        	oldfilename = f"{key0}/{key1}"
+        	newfilename = f"{key0}/{key2}"
+        	await s3_cut(url, bucket, newfilename, oldfilename, access, secret)
+        	await utils.answer(message, f"✅ <b>Файл</b> <code>{oldfilename}</code> <b>успешно переименован в</b> <code>{newfilename}</code>!</b>")
+        except Exception as e:
+        	await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
+        	
+    @loader.command()
+    async def S3cut(self, message):
+        """<file> <old_folder> <new_folder> - вырезает файл. Пробелы в адресе заменяйте на %20"""
+        url = self.config["url"] or "None"
+        bucket = self.config["bucketname"] or "None"
+        access = self.config["access_key"] or "None"
+        secret = self.config["secret_key"] or "None"
+        if url == "None" or bucket == "None" or secret == "None" or access == "None":
+            await utils.answer(message, f"❌ <b>Вы не настроили модуль! Укажите необходимые данные в config. Команда: </b><code>{self.get_prefix()}config S3</code>")
+            return
+        args = utils.get_args_raw(message)
+        if args:
+        	keys = args.split(" ")
+        	if len(keys) == 3 or len(keys) > 3:
+        		key0 = keys[0]
+        		key0 = key0[1:] if key0.startswith('/') else key0
+        		key0 = key0.replace("%20", " ")
+        		
+        		key1 = keys[1]
+        		key1 = key1[1:] if key1.startswith('/') else key1
+        		key1 = key1.replace("%20", " ")
+        		
+        		key2 = keys[2]
+        		key2 = key2[1:] if key2.startswith('/') else key2
+        		key2 = key2.replace("%20", " ")
+        	else:
+        		await utils.answer(message, "❌ <b>Вы указали недостаточно аргументов!</b>")
+        		return
+        else:
+        	await utils.answer(message, "❌ <b>Вы не указали файл для вырезания!</b>")
+        	return
+        try:
+        	oldfilename = f"{key1}/{key0}"
+        	newfilename = f"{key2}/{key0}"
+        	await s3_cut(url, bucket, newfilename, oldfilename, access, secret)
+        	await utils.answer(message, f"✅ <b>Файл</b> <code>{oldfilename}</code> <b>успешно вырезан в</b> <code>{newfilename}</code>!</b>")
+        except Exception as e:
+        	await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
+        	
+    @loader.command()
+    async def S3copy(self, message):
+        """<file> <old_folder> <new_folder> - копирует файл. Пробелы в адресе заменяйте на %20"""
+        url = self.config["url"] or "None"
+        bucket = self.config["bucketname"] or "None"
+        access = self.config["access_key"] or "None"
+        secret = self.config["secret_key"] or "None"
+        if url == "None" or bucket == "None" or secret == "None" or access == "None":
+            await utils.answer(message, f"❌ <b>Вы не настроили модуль! Укажите необходимые данные в config. Команда: </b><code>{self.get_prefix()}config S3</code>")
+            return
+        args = utils.get_args_raw(message)
+        if args:
+        	keys = args.split(" ")
+        	if len(keys) == 3 or len(keys) > 3:
+        		key0 = keys[0]
+        		key0 = key0[1:] if key0.startswith('/') else key0
+        		key0 = key0.replace("%20", " ")
+        		
+        		key1 = keys[1]
+        		key1 = key1[1:] if key1.startswith('/') else key1
+        		key1 = key1.replace("%20", " ")
+        		
+        		key2 = keys[2]
+        		key2 = key2[1:] if key2.startswith('/') else key2
+        		key2 = key2.replace("%20", " ")
+        	else:
+        		await utils.answer(message, "❌ <b>Вы указали недостаточно аргументов!</b>")
+        		return
+        else:
+        	await utils.answer(message, "❌ <b>Вы не указали файл для копирования!</b>")
+        	return
+        try:
+        	oldfilename = f"{key1}/{key0}"
+        	newfilename = f"{key2}/{key0}"
+        	await s3_copy(url, bucket, newfilename, oldfilename, access, secret)
+        	await utils.answer(message, f"✅ <b>Файл</b> <code>{oldfilename}</code> <b>успешно копирован в</b> <code>{newfilename}</code>!</b>")
         except Exception as e:
         	await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
         	
@@ -243,3 +467,53 @@ class S3Mod(loader.Module):
         await self.allmodules.commands["config"](
             await utils.answer(message, f"{self.get_prefix()}config {name}")
         )
+        
+    @loader.command()
+    async def S3usage(self, message):
+        """- сколько занято памяти на S3"""
+        url = self.config["url"] or "None"
+        bucket = self.config["bucketname"] or "None"
+        access = self.config["access_key"] or "None"
+        secret = self.config["secret_key"] or "None"
+        if url == "None" or bucket == "None" or secret == "None" or access == "None":
+            await utils.answer(message, f"❌ <b>Вы не настроили модуль! Укажите необходимые данные в config. Команда: </b><code>{self.get_prefix()}config S3</code>")
+            return
+        try:
+        	usage = await s3_usage(url, bucket, access, secret)
+        	await utils.answer(message, f"🗂 <b>Использовано</b> <code>{round(usage, 2)}</code> <b>ГБ памяти.</b>")
+        except Exception as e:
+        	await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
+        	
+    @loader.command()
+    async def S3clear(self, message):
+        """- удаление незавершенных загрузок"""
+        url = self.config["url"] or "None"
+        bucket = self.config["bucketname"] or "None"
+        access = self.config["access_key"] or "None"
+        secret = self.config["secret_key"] or "None"
+        if url == "None" or bucket == "None" or secret == "None" or access == "None":
+            await utils.answer(message, f"❌ <b>Вы не настроили модуль! Укажите необходимые данные в config. Команда: </b><code>{self.get_prefix()}config S3</code>")
+            return
+        try:
+        	await utils.answer(message, "🔎 <b>Ищу незавершенные загрузки...</b>")
+        	clear = await s3_clear(url, bucket, access, secret)
+        	await utils.answer(message, f"🗂 <b>Удалено</b> <code>{clear}</code> <b>неудавшихся загрузок.</b>")
+        except Exception as e:
+        	await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
+        	
+    @loader.command()
+    async def S3purge(self, message):
+        """- ПОЛНАЯ ОЧИСТКА ХРАНИЛИЩА S3. Будьте осторожны с этой командой"""
+        url = self.config["url"] or "None"
+        bucket = self.config["bucketname"] or "None"
+        access = self.config["access_key"] or "None"
+        secret = self.config["secret_key"] or "None"
+        if url == "None" or bucket == "None" or secret == "None" or access == "None":
+            await utils.answer(message, f"❌ <b>Вы не настроили модуль! Укажите необходимые данные в config. Команда: </b><code>{self.get_prefix()}config S3</code>")
+            return
+        try:
+        	await utils.answer(message, "🗂 <b>Начинаю очистку...</b>")
+        	clear = await s3_purge(url, bucket, access, secret)
+        	await utils.answer(message, f"🗂 <b>Ваше S3 хранилище полностью очищено.</b>")
+        except Exception as e:
+        	await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
