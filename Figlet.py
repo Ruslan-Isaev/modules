@@ -25,4 +25,4 @@ World!`
         """<text> - делает текст большим"""
         mtext = message.text[8:]
         ftext = pyfiglet.figlet_format(mtext)
-        await utils.answer(message, f"<code>{ftext}</code>")
+        await utils.answer(message, f"<code>⁣{ftext}</code>")
