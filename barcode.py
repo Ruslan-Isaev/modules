@@ -1,6 +1,6 @@
 version = (1, 0, 0)
 
-# meta developer: @username
+# meta developer: @RUIS_VlP
 # requires: treepoem, pillow
 from .. import loader, utils
 import treepoem
