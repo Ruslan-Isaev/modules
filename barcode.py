@@ -1,20 +1,21 @@
-version = (1, 0, 0)
+__version__ = (2, 0, 0)
 
 # meta developer: @RUIS_VlP
-# requires: treepoem pillow
+# requires: python-barcode[images]
+import barcode
+from barcode.writer import ImageWriter
 from .. import loader, utils
-import treepoem
 import uuid
 import os
-from PIL import Image, ImageOps
 
-async def generate_barcode(data, filename, border_size=20):
-    barcode = treepoem.generate_barcode(
-            barcode_type="code128",
-            data=data
-        )
-    barcode_with_border = ImageOps.expand(barcode, border=border_size, fill="white")
-    barcode_with_border.save(filename)
+async def generate_barcode(data, filename):
+    options = {
+        'write_text': False,
+        'quiet_zone': 2,
+        'module_height': 15.0
+    }
+    code128 = barcode.get('code128', data, writer=ImageWriter())
+    code128.save(filename, options)
 
 @loader.tds
 class BarcodeGeneratorMod(loader.Module):
@@ -28,8 +29,10 @@ class BarcodeGeneratorMod(loader.Module):
     async def barcodecmd(self, message):
         """<код> - генерирует штрих-код"""
         args = utils.get_args_raw(message)
+        if not args:
+        	args = " "
         randuuid = str(uuid.uuid4())
         filename = f"{randuuid}.png"
-        await generate_barcode(args, filename)
+        await generate_barcode(args, randuuid)
         await utils.answer_file(message, filename, caption=args)
         os.remove(filename)
