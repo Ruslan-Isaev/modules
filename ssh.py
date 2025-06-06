@@ -1,6 +1,7 @@
 version = (1, 0, 0)
 
 # meta developer: @RUIS_VlP
+# requires: paramiko
 
 import random
 from datetime import timedelta
