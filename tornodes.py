@@ -1,4 +1,5 @@
 # meta developer: @matubuntu
+# requires: qrcode httpx
 import os
 import re
 import qrcode
