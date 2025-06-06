@@ -13,6 +13,8 @@ from .. import loader, utils
 
 import paramiko
 
+# requires: paramiko
+
 def upload_file_sftp(host, port, username, password, local_file, remote_file):
     try:
         # Создаем экземпляр SSHClient
