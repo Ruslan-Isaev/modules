@@ -1,6 +1,7 @@
 version = (1, 0, 0)
 
 # meta developer: @RUIS_VlP
+# requires: yt_dlp
 
 import yt_dlp
 import uuid
