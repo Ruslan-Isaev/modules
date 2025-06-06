@@ -7,6 +7,7 @@ __version__ = (1, 2, 0)
 # changelog 1.2.0: добавлены команды для переименования, вырезания, копирования файлов, просмотра занятого места, отмены незавершенных загрузок и полной очистки S3 хранилища
 
 # meta developer: @RUIS_VlP
+# requires: aioboto3, aiofiles
 
 import aioboto3
 import aiofiles
