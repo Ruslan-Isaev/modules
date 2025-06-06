@@ -1,4 +1,5 @@
 # meta developer: @RUIS_VlP
+# requires: pyfiglet
 
 import random
 from telethon import functions
