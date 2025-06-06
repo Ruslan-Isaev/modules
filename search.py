@@ -1,5 +1,5 @@
 # meta developer: @RUIS_VlP
-# requires: requests, pillow
+# requires: requests pillow
 
 from telethon import TelegramClient, events
 from .. import loader, utils
