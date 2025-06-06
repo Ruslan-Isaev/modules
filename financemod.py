@@ -4,6 +4,8 @@ from datetime import datetime
 from .. import loader, utils
 import lxml
 
+# requires: lxml requests bs4
+
 _FLAGS = {
     "AUD": "🇦🇺",
     "AZN": "🇦🇿",
