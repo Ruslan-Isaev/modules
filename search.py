@@ -1,4 +1,6 @@
 # meta developer: @RUIS_VlP
+# requires: requests, pillow
+
 from telethon import TelegramClient, events
 from .. import loader, utils
 from urllib.parse import quote
