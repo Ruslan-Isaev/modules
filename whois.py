@@ -63,7 +63,7 @@ async def get_whois(identifier, API_KEY: str) -> dict:
             return response
             
 async def fetch_dns_record(session, domain, record_type):
-    url = "https://unfiltered.adguard-dns.com/resolve"
+    url = "https://dns.google/resolve"
     headers = {"accept": "application/dns-json"}
     params = {"name": domain, "type": record_type}
 
