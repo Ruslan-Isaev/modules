@@ -50,33 +50,3 @@ class TTFMod(loader.Module):
         # Удаление файла
         os.remove(file_path)
     
-    @loader.command()
-    async def ttf_noreply(self, message):
-        """
-        Создает текстовый файл с заданным именем и расширением, 
-        записывает в него текст, отправляет его в Telegram и удаляет с диска.
-
-        Пример:
-        .ttf название.txt
-        Текст для файла
-
-        """
-        args = utils.get_args_raw(message).split("\n")
-        if len(args) < 1:
-            await message.edit("Недостаточно аргументов. Используйте: .ttf название.txt\nТекст для файла")
-            return
-
-        filename = args[0].strip()
-        text = "\n".join(args[1:])
-
-        # Создание файла
-        file_path = os.path.join(os.getcwd(), filename)
-        with open(file_path, 'w') as file:
-            file.write(text)
-        await message.client.delete_messages(message.chat_id, message.id)
-        # Отправка файла
-        await message.client.send_file(message.chat_id, file_path)
-
-        # Удаление файла
-        os.remove(file_path)
-        
