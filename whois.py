@@ -14,7 +14,7 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see https://www.gnu.org/licenses/."""
 
-__version__ = (3, 0, 0)
+__version__ = (3, 0, 1)
 
 # meta developer: @RUIS_VlP
 # при поддержке @hikka_mods
@@ -302,7 +302,7 @@ class WhoisMod(loader.Module):
         if not domain:
             await utils.answer(message, "❌ <b>Вы не указали домен!</b>")
             return
-            
+        await utils.answer(message, "📡 <i>Отправляю запрос...</i>")
         try:
             check = await ipcheck(domain)
             clean = await clean_domain(domain)
@@ -319,4 +319,8 @@ class WhoisMod(loader.Module):
             text = await json2text(info, ips, "domain")
             await utils.answer(message, text)
         except Exception as e:
-            await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
+            if "404" in str(e):
+            	await utils.answer(message, f"<emoji document_id=5224450179368767019>🌎</emoji><b>Домен:</b> <code>{clean}</code>\n\n<emoji document_id=4985637404867036136>🖥</emoji> <b>Домен свободен</b>")
+            	return
+            else:
+            	await utils.answer(message, f"❌ <b>Ошибка!</b>\n\n<code>{e}</code>")
