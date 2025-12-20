@@ -52,14 +52,47 @@ async def get_whois(identifier, API_KEY: str = None) -> dict:
     
     if check == "ip":
         url = f"http://ipwho.is/{identifier}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                response = await resp.json()
+                return response
     else:
-        url = f"https://rdap.active.domains/domain/{identifier}"
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            response = await resp.json()
-            return response
+        # Основной RDAP сервис
+        url_primary = f"https://rdap.org/domain/{identifier}"
+        # Резервный RDAP сервис
+        url_backup = f"https://rdap.active.domains/domain/{identifier}"
+        
+        # Заголовки для обхода блокировок
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/rdap+json, application/json'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url_primary, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status in (404, 403, 429, 500, 502, 503):
+                        # Если ошибка на основном, пробуем резервный
+                        async with session.get(url_backup, headers=headers) as resp_backup:
+                            resp_backup.raise_for_status()
+                            response = await resp_backup.json()
+                            return response
+                    resp.raise_for_status()
+                    response = await resp.json()
+                    return response
+            except aiohttp.ClientResponseError as e:
+                # Любая HTTP ошибка - пробуем резервный
+                async with session.get(url_backup, headers=headers) as resp_backup:
+                    resp_backup.raise_for_status()
+                    response = await resp_backup.json()
+                    return response
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                # При ошибке соединения пробуем резервный
+                async with session.get(url_backup, headers=headers) as resp_backup:
+                    resp_backup.raise_for_status()
+                    response = await resp_backup.json()
+                    return response
             
 async def fetch_dns_record(session, domain, record_type):
     url = "https://dns.google/resolve"
