@@ -1,12 +1,12 @@
-version = (2, 3, 0)
-
 # meta developer: @RUIS_VlP, @RoKrz
+# meta banner: https://raw.githubusercontent.com/Ruslan-Isaev/modules/refs/heads/main/photos/banner.jpg
 # requires: yt_dlp aiohttp aiofiles
 
 import yt_dlp
 import uuid
 import os
 import re
+import json
 import random
 import asyncio
 import shutil
@@ -17,6 +17,20 @@ import urllib.parse
 import aiohttp
 import aiofiles
 from pathlib import Path
+from telethon.tl.types import MessageEntityTextUrl
+from herokutl.tl.functions.messages import SendMessageRequest, UploadMediaRequest
+from herokutl.tl.types import (
+    InputMediaUploadedPhoto,
+    InputPhoto,
+    InputReplyToMessage,
+    InputRichMessage,
+    PageBlockPhoto,
+    PageBlockSlideshow,
+    PageCaption,
+    TextEmpty,
+    TextPlain,
+)
+from herokutl.extensions import html as herokutl_html
 from .. import loader, utils
 import logging
 
@@ -49,10 +63,13 @@ def extract_video_link(text):
         r"https?://[^\s]+\.(mp4|webm|avi|mkv|mov|flv|m4v|mp3|m4a|wav|flac)",
     ]
 
+    all_matches = []
     for pattern in video_sites_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(0)
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            all_matches.append(match)
+    if all_matches:
+        all_matches.sort(key=lambda m: m.start())
+        return all_matches[0].group(0)
 
     general_url_pattern = r"https?://[^\s]+"
     match = re.search(general_url_pattern, text)
@@ -66,6 +83,137 @@ def extract_video_link(text):
             return url
 
     return None
+
+
+def find_video_link_in_message(message):
+    if not message:
+        return None
+
+    link = extract_video_link(message.raw_text or "")
+    if link:
+        return link
+
+    for entity in (message.entities or []):
+        if isinstance(entity, MessageEntityTextUrl):
+            found = extract_video_link(entity.url)
+            if found:
+                return found
+
+    return None
+
+
+def parse_time_to_seconds(time_str):
+    if not time_str:
+        return None
+
+    time_str = time_str.strip().lower()
+
+    yt_style = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", time_str)
+    if yt_style and any(yt_style.groups()):
+        h, m, s = yt_style.groups()
+        return int(h or 0) * 3600 + int(m or 0) * 60 + float(s or 0)
+
+    if ":" in time_str:
+        parts = time_str.split(":")
+        try:
+            parts = [float(p) if i == len(parts) - 1 else int(p) for i, p in enumerate(parts)]
+        except ValueError:
+            return None
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        return None
+
+    try:
+        return float(time_str)
+    except ValueError:
+        return None
+
+    return None
+
+
+def format_seconds(total_seconds):
+    if total_seconds is None:
+        total_seconds = 0
+    whole = int(total_seconds)
+    frac_ms = round((total_seconds - whole) * 1000)
+    if frac_ms >= 1000:
+        whole += 1
+        frac_ms = 0
+    h, rem = divmod(whole, 3600)
+    m, s = divmod(rem, 60)
+    ms_part = f".{frac_ms:03d}" if frac_ms else ""
+    if h:
+        return f"{h}:{m:02d}:{s:02d}{ms_part}"
+    return f"{m}:{s:02d}{ms_part}"
+
+
+SITE_EMOJI = [
+    (("youtube.com", "youtu.be"), "🔴", "5355235592844095825"),
+    (("tiktok.com",), "🎵", "5353034628263330616"),
+    (("instagram.com",), "📸", "5355097780228470775"),
+    (("x.com", "twitter.com"), "🐦", "5355148941878900494"),
+    (("facebook.com",), "👥", "5355254460635428635"),
+    (("vimeo.com",), "🎬", "5334764984142412896"),
+    (("twitch.tv",), "🎮", "5352759664457038886"),
+    (("reddit.com",), "👽", "5352531593103686999"),
+    (("music.yandex",), "🎧", "5346296430166293639"),
+    (("soundcloud.com",), "☁️", "5345844509412444249"),
+    (("bandcamp.com",), "🎸", "5451966206334513619"),
+    (("spotify.com",), "🟢", "5346074681004801565"),
+    (("rutube.ru",), "▶️", "5298747646096187189"),
+    (("vk.com",), "🔵", "5278229754099540071"),
+    (("ok.ru",), "🟠", "5310076528577491230"),
+]
+
+
+def get_site_emoji_html(url):
+    url_lower = (url or "").lower()
+    for domains, fallback, premium_id in SITE_EMOJI:
+        if any(d in url_lower for d in domains):
+            if premium_id:
+                return f'<tg-emoji emoji-id="{premium_id}">{fallback}</tg-emoji>'
+            return fallback
+    return "🎥"
+
+
+def extract_url_timecode(url):
+    match = re.search(r"[?&]t=([0-9hms]+)", url)
+    if not match:
+        match = re.search(r"[?&]start=(\d+)", url)
+    if match:
+        return parse_time_to_seconds(match.group(1))
+    return None
+
+
+def parse_dlvideo_args(args_str):
+    result = {"audio_only": False, "start": None, "end": None, "rest": ""}
+    if not args_str:
+        return result
+
+    tokens = args_str.split()
+    rest_tokens = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        low = tok.lower()
+
+        if low in ("-a", "-audio", "--audio"):
+            result["audio_only"] = True
+        elif low in ("-s", "-start", "--start") and i + 1 < len(tokens):
+            result["start"] = parse_time_to_seconds(tokens[i + 1])
+            i += 1
+        elif low in ("-e", "-end", "--end") and i + 1 < len(tokens):
+            result["end"] = parse_time_to_seconds(tokens[i + 1])
+            i += 1
+        else:
+            rest_tokens.append(tok)
+
+        i += 1
+
+    result["rest"] = " ".join(rest_tokens)
+    return result
 
 
 def get_random_user_agent():
@@ -107,6 +255,342 @@ SPONSORBLOCK_CATEGORY_IDS = ["sponsor", "interaction", "selfpromo", "intro", "ou
 
 DEFAULT_SB_CATEGORIES = ["sponsor", "interaction"]
 
+VOT_BRIDGE_SCRIPT = """function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadVOTClient() {
+  if (typeof globalThis.File === "undefined") {
+    const bufferModule = await import("node:buffer");
+    if (bufferModule.File) {
+      globalThis.File = bufferModule.File;
+    }
+  }
+  const mod = await import("@vot.js/node");
+  return { VOTClient: mod.default, videoDataUtil: mod.videoData };
+}
+
+async function translateVideoUrl(videoUrl, responseLang, maxWaitSeconds) {
+  const { VOTClient, videoDataUtil } = await loadVOTClient();
+  const data = await videoDataUtil.getVideoData(videoUrl);
+  const client = new VOTClient();
+
+  const deadline = Date.now() + maxWaitSeconds * 1000;
+  let result = await client.translateVideo({
+    videoData: data,
+    requestLang: "auto",
+    responseLang,
+  });
+
+  while (!result.translated || result.remainingTime >= 1) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for translation (status ${result.status})`);
+    }
+    const waitMs = Math.min(Math.max(result.remainingTime, 1), 15) * 1000;
+    await sleep(waitMs);
+    result = await client.translateVideo({
+      videoData: data,
+      requestLang: "auto",
+      responseLang,
+    });
+  }
+
+  return {
+    url: result.url,
+    translationId: result.translationId,
+    title: data.title || null,
+  };
+}
+
+async function main() {
+  const [, , videoUrl, responseLang = "ru", maxWaitSeconds = "180"] = process.argv;
+
+  if (!videoUrl) {
+    console.log(JSON.stringify({ ok: false, error: "no_url" }));
+    process.exit(1);
+  }
+
+  try {
+    const translation = await translateVideoUrl(videoUrl, responseLang, Number(maxWaitSeconds));
+    console.log(JSON.stringify({ ok: true, ...translation }));
+  } catch (err) {
+    console.log(JSON.stringify({ ok: false, error: String((err && err.message) || err) }));
+    process.exit(1);
+  }
+}
+
+main();
+"""
+
+
+LANG_DISPLAY = {
+    "en": "EN", "ru": "RU", "uk": "UK", "de": "DE", "ja": "JA",
+    "es": "ES", "fr": "FR", "it": "IT", "pt": "PT", "ko": "KO",
+    "zh": "ZH", "tr": "TR", "pl": "PL", "ar": "AR", "hi": "HI",
+}
+
+
+def lang_display(code):
+    if not code:
+        return "??"
+    code = code.lower().split("-")[0]
+    return LANG_DISPLAY.get(code, code.upper())
+
+
+def get_vot_bridge_dir():
+    return os.path.join(utils.get_base_dir(), "vot_bridge")
+
+
+async def ensure_vot_bridge_ready():
+    bridge_dir = get_vot_bridge_dir()
+    script_path = os.path.join(bridge_dir, "vot_bridge.mjs")
+    node_modules_path = os.path.join(bridge_dir, "node_modules", "@vot.js")
+
+    os.makedirs(bridge_dir, exist_ok=True)
+
+    async with aiofiles.open(script_path, "w", encoding="utf-8") as f:
+        await f.write(VOT_BRIDGE_SCRIPT)
+
+    if not shutil.which("node") or not shutil.which("npm"):
+        raise Exception("Node.js/npm не найдены на сервере — озвучка требует их установки отдельно")
+
+    await ensure_node_version_ok()
+
+    if not os.path.isdir(node_modules_path):
+        proc = await asyncio.create_subprocess_exec(
+            "npm", "install", "@vot.js/node", "--no-audit", "--no-fund",
+            cwd=bridge_dir,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise Exception(f"npm install @vot.js/node не удался: {stderr.decode()[:300]}")
+
+    return script_path
+
+
+async def get_node_major_version():
+    proc = await asyncio.create_subprocess_exec(
+        "node", "--version",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    version_str = stdout.decode().strip()
+    match = re.match(r"v?(\d+)\.", version_str)
+    return int(match.group(1)) if match else None
+
+
+async def ensure_node_version_ok(minimum=20):
+    major = await get_node_major_version()
+    if major is not None and major >= minimum:
+        return
+
+    if not shutil.which("n"):
+        raise Exception(
+            f"Node.js слишком старый (нужен {minimum}+), а менеджер версий n не найден. "
+            f"Выполните вручную: n latest"
+        )
+
+    proc = await asyncio.create_subprocess_exec(
+        "n", "latest",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+
+    new_major = await get_node_major_version()
+    if new_major is None or new_major < minimum:
+        raise Exception(
+            f"Node.js слишком старый (нужен {minimum}+) и автообновление через 'n latest' не сработало "
+            f"({stderr.decode()[:200]}). Выполните вручную: n latest"
+        )
+
+
+async def get_translated_audio(video_url, response_lang="ru", max_wait_seconds=180):
+    script_path = await ensure_vot_bridge_ready()
+
+    proc = await asyncio.create_subprocess_exec(
+        "node", script_path, video_url, response_lang, str(max_wait_seconds),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+
+    try:
+        result = json.loads(stdout.decode().strip().splitlines()[-1])
+    except Exception:
+        raise Exception(f"Не удалось разобрать ответ моста озвучки: {stderr.decode()[:300] or stdout.decode()[:300]}")
+
+    if not result.get("ok"):
+        raise Exception(result.get("error", "неизвестная ошибка озвучки"))
+
+    return result["url"], result.get("title")
+
+
+async def mux_translated_audio(video_path, audio_url, orig_volume_percent=50):
+    output_path = video_path + ".vo.mp4"
+    audio_temp = video_path + ".vo_audio.tmp"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(audio_url) as resp:
+            async with aiofiles.open(audio_temp, "wb") as f:
+                async for chunk in resp.content.iter_chunked(8192):
+                    await f.write(chunk)
+
+    extra_gain = max(0, min(100, orig_volume_percent)) / 100
+
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_temp,
+        "-filter_complex",
+        f"[0:a][1:a]sidechaincompress=threshold=0.02:ratio=15:attack=50:release=400:makeup=1[ducked];"
+        f"[ducked]volume={extra_gain}[quiet];"
+        f"[quiet][1:a]amix=inputs=2:duration=shortest:dropout_transition=0:normalize=0[aout]",
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-shortest",
+        output_path,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+
+    try:
+        os.remove(audio_temp)
+    except Exception:
+        pass
+
+    if proc.returncode != 0 or not os.path.exists(output_path):
+        raise Exception("ffmpeg не смог вклеить переведённую дорожку")
+
+    try:
+        os.remove(video_path)
+    except Exception:
+        pass
+
+    return output_path
+
+
+async def resolve_tiktok_url(url):
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+async def tikwm_lookup(url):
+    resolved = await resolve_tiktok_url(url)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://www.tikwm.com/api/",
+            params={"url": resolved},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            payload = await resp.json(content_type=None)
+
+    if payload.get("code") != 0:
+        raise Exception(payload.get("msg", "tikwm вернул ошибку"))
+
+    return payload.get("data") or {}
+
+
+async def download_file(url, output_dir, ext, min_size=512, retries=2):
+    path = os.path.join(output_dir, f"{uuid.uuid4()}.{ext}")
+    last_err = None
+    for attempt in range(retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    async with aiofiles.open(path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            await f.write(chunk)
+
+            if os.path.isfile(path) and os.path.getsize(path) >= min_size:
+                return path
+            last_err = Exception(f"файл слишком маленький ({os.path.getsize(path) if os.path.isfile(path) else 0} байт)")
+        except Exception as e:
+            last_err = e
+
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    raise last_err or Exception("не удалось скачать файл")
+
+
+async def download_tiktok_via_api(url, output_dir):
+    data = await tikwm_lookup(url)
+    video_url = data.get("play") or data.get("hdplay")
+    if not video_url:
+        raise Exception("tikwm не вернул ссылку на видео")
+
+    title = data.get("title") or "TikTok"
+    author = ((data.get("author") or {}).get("nickname")) or None
+    file_path = await download_file(video_url, output_dir, "mp4")
+
+    return file_path, title, author
+
+
+async def download_tiktok_slideshow(url, output_dir):
+    data = await tikwm_lookup(url)
+    images = data.get("images") or []
+    if not images:
+        return None
+
+    image_paths = []
+    for image_url in images:
+        image_paths.append(await download_file(image_url, output_dir, "jpg"))
+
+    audio_path = None
+    music_url = data.get("music")
+    if music_url:
+        audio_path = await download_file(music_url, output_dir, "mp3")
+
+    title = data.get("title") or "TikTok"
+    author = ((data.get("author") or {}).get("nickname")) or None
+    music_title = (data.get("music_info") or {}).get("title")
+
+    return image_paths, audio_path, title, author, music_title
+
+
+async def send_tiktok_rich_slideshow(client, chat_id, image_paths, caption_html, reply_to_msg_id=None):
+    input_peer = await client.get_input_entity(chat_id)
+
+    input_photos = []
+    for path in image_paths:
+        uploaded_file = await client.upload_file(path)
+        media = await client(
+            UploadMediaRequest(peer=input_peer, media=InputMediaUploadedPhoto(file=uploaded_file))
+        )
+        photo = media.photo
+        input_photos.append(
+            InputPhoto(id=photo.id, access_hash=photo.access_hash, file_reference=photo.file_reference)
+        )
+
+    items = [
+        PageBlockPhoto(photo_id=ip.id, caption=PageCaption(text=TextEmpty(), credit=TextEmpty()))
+        for ip in input_photos
+    ]
+    slideshow = PageBlockSlideshow(items=items, caption=PageCaption(text=TextEmpty(), credit=TextEmpty()))
+    rich_message = InputRichMessage(blocks=[slideshow], photos=input_photos)
+
+    text, entities = herokutl_html.parse(caption_html) if caption_html else ("", [])
+    reply_to = InputReplyToMessage(reply_to_msg_id=reply_to_msg_id) if reply_to_msg_id else None
+
+    await client(
+        SendMessageRequest(
+            peer=input_peer,
+            message=text,
+            entities=entities or None,
+            rich_message=rich_message,
+            reply_to=reply_to,
+            silent=True,
+            random_id=int.from_bytes(os.urandom(8), "big", signed=True),
+        )
+    )
+
 
 async def download_media(
     url,
@@ -116,6 +600,8 @@ async def download_media(
     max_attempts=50,
     audio_only=False,
     sponsorblock_categories=None,
+    start_time=None,
+    end_time=None,
     on_attempt=None,
 ):
     output_dir = utils.get_base_dir()
@@ -209,6 +695,13 @@ async def download_media(
                             'remove_sponsor_segments': sponsorblock_categories,
                         })
 
+                    if start_time is not None or end_time is not None:
+                        section = {'start_time': start_time or 0}
+                        if end_time is not None:
+                            section['end_time'] = end_time
+                        ydl_opts['download_ranges'] = lambda info, ydl_instance, section=section: [section]
+                        ydl_opts['force_keyframes_at_cuts'] = True
+
                     ydl_opts['extractor_retries'] = 5
                     ydl_opts['fragment_retries'] = 15
                     ydl_opts['retries'] = 15
@@ -237,8 +730,9 @@ async def download_media(
 
                             title = info_dict.get('title', 'Media')
                             channel = info_dict.get('uploader', None)
+                            source_lang = info_dict.get('language', None)
 
-                        return file_path, title, channel
+                        return file_path, title, channel, source_lang
 
                     except Exception as e:
                         error_str = str(e)
@@ -271,48 +765,55 @@ def convert_markdown_to_html(template: str, link: str) -> str:
 
 @loader.tds
 class YouTube_DLDMod(loader.Module):
-    """Помогает скачивать видео с YouTube, TikTok и др. Поддерживает SponsorBlock — вырезает рекламные и другие ненужные вставки прямо из видео при скачивании."""
+    """Помогает скачивать видео с YouTube, TikTok и др. SponsorBlock вырезает рекламу, -s/-e берут только отрезок."""
+
+    __version__ = (3, 2, 1)
 
     strings = {
         "name": "YouTube-DLD",
         "no_link": "❌ <b>Пожалуйста, укажите ссылку на видео либо ответьте на сообщение с ней.</b>",
         "default_downloading": "📥 <b>Начинаю загрузку...</b>\n\n<i>Попытка {attempt} ({method})</i>",
         "default_error": "❌ <b>Ошибка после {attempts} попыток!</b>\n\n<code>{error}</code>",
-        "default_response": "🎥 Вот [ваше видео]({link})!\n\n<code>{title}</code>",
-        "default_music_response": "🎵 <b>Аудио готово!</b>\n\n<code>{title}</code>",
-        "default_channel": "📺 Канал: <code>{channel}</code>",
+        "default_response": "{site} Вот [ваше видео]({link})!\n\n<code>{title}</code>",
+        "default_music_response": "🎵 <b>Аудио готово!</b> [ссылка]({link})\n\n<code>{title}</code>",
+        "default_channel": "<tg-emoji emoji-id=\"5886412370347036129\">👤</tg-emoji> Канал: <code>{channel}</code>",
         "downloading_audio": "🎵 <b>Скачиваю аудио...</b>",
         "done_fallback": "Готово!",
         "method_proxy": "прокси",
         "method_cookies": "куки",
         "method_direct": "напрямую",
+        "cookies_required_error": "❌ <b>Ошибка куки.</b> Просьба вставить куки через команду <code>.cfg YouTube-DLD youtube_cookies</code>.",
         "supported_sites": """🎥 <b>Поддерживаемые сайты:</b>
 
-🔴 <b>YouTube</b> — youtube.com, youtu.be, music.youtube.com
-🎵 <b>TikTok</b> — tiktok.com, vt.tiktok.com, vm.tiktok.com
-📸 <b>Instagram</b> — instagram.com
-🐦 <b>X (Twitter)</b> — x.com, twitter.com
-👥 <b>Facebook</b> — facebook.com
-🎬 <b>Vimeo</b> — vimeo.com
-📺 <b>Twitch</b> — twitch.tv
-🤖 <b>Reddit</b> — reddit.com
+<tg-emoji emoji-id="5355235592844095825">🔴</tg-emoji> <b>YouTube</b> — youtube.com, youtu.be, music.youtube.com
+<tg-emoji emoji-id="5353034628263330616">🎵</tg-emoji> <b>TikTok</b> — tiktok.com, vt.tiktok.com, vm.tiktok.com
+<tg-emoji emoji-id="5355097780228470775">📸</tg-emoji> <b>Instagram</b> — instagram.com
+<tg-emoji emoji-id="5355148941878900494">🐦</tg-emoji> <b>X (Twitter)</b> — x.com, twitter.com
+<tg-emoji emoji-id="5355254460635428635">👥</tg-emoji> <b>Facebook</b> — facebook.com
+<tg-emoji emoji-id="5334764984142412896">🎬</tg-emoji> <b>Vimeo</b> — vimeo.com
+<tg-emoji emoji-id="5352759664457038886">🎮</tg-emoji> <b>Twitch</b> — twitch.tv
+<tg-emoji emoji-id="5352531593103686999">👽</tg-emoji> <b>Reddit</b> — reddit.com
 
 <b>🎵 Музыка:</b>
-▫️ <b>Яндекс.Музыка</b> — music.yandex.ru
-▫️ <b>SoundCloud</b> — soundcloud.com
-▫️ <b>Bandcamp</b> — bandcamp.com
-▫️ <b>Spotify</b> — spotify.com
+<tg-emoji emoji-id="5346296430166293639">🎧</tg-emoji> <b>Яндекс.Музыка</b> — music.yandex.ru
+<tg-emoji emoji-id="5345844509412444249">☁️</tg-emoji> <b>SoundCloud</b> — soundcloud.com
+<tg-emoji emoji-id="5451966206334513619">🎸</tg-emoji> <b>Bandcamp</b> — bandcamp.com
+<tg-emoji emoji-id="5346074681004801565">🟢</tg-emoji> <b>Spotify</b> — spotify.com
 
 <b>🇷🇺 Российские:</b>
-▫️ <b>RuTube</b> — rutube.ru
-▫️ <b>ВКонтакте</b> — vk.com
-▫️ <b>Одноклассники</b> — ok.ru
+<tg-emoji emoji-id="5298747646096187189">▶️</tg-emoji> <b>RuTube</b> — rutube.ru
+<tg-emoji emoji-id="5278229754099540071">🔵</tg-emoji> <b>ВКонтакте</b> — vk.com
+<tg-emoji emoji-id="5310076528577491230">🟠</tg-emoji> <b>Одноклассники</b> — ok.ru
+
+Полный список поддерживаемых сайтов — <a href="https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md">тут</a>.
 
 <b>📝 Команды:</b>
 ▫️ .dlvideo <ссылка> — скачать видео
 ▫️ .dlvideo -a <ссылка> — скачать аудио
+▫️ .dlvideo -s 1:30 -e 5:00 <ссылка> — только отрезок (можно и без -e)
 ▫️ .dvlist — список сайтов
-▫️ .sblock — настройки SponsorBlock (инлайн-меню)""",
+▫️ .sblock — настройки SponsorBlock (инлайн-меню)
+▫️ .dlvo — то же самое, что .dlvideo, но с переводом озвучки""",
         "sb_state_on": "включён ✅",
         "sb_state_off": "выключен 🚫",
         "sb_main_text": "✂️ <b>SponsorBlock</b> — {state}\n\n✅ — вырежется при скачивании, ❌ — останется в видео.\nУ пункта с ⚙️ есть отдельные настройки.",
@@ -333,6 +834,8 @@ class YouTube_DLDMod(loader.Module):
         "sb_music_only_btn": "Только на music.youtube.com",
         "sb_back": "◀️ Назад",
         "sb_saved": "Сохранено",
+        "vo_translating": "🗣 <b>Перевожу озвучку...</b>\n\n<i>Это не мгновенно, может занять пару минут.</i>",
+        "vo_failed": "⚠️ Озвучка не получилась: <code>{error}</code>\n\nОтправляю видео без перевода...",
         "cat_sponsor": "📢 Спонсор",
         "cat_interaction": "🔔 Подписка",
         "cat_selfpromo": "🎗 Самореклама",
@@ -347,41 +850,46 @@ class YouTube_DLDMod(loader.Module):
         "no_link": "❌ <b>Please provide a video link, or reply to a message that has one.</b>",
         "default_downloading": "📥 <b>Starting download...</b>\n\n<i>Attempt {attempt} ({method})</i>",
         "default_error": "❌ <b>Failed after {attempts} attempts!</b>\n\n<code>{error}</code>",
-        "default_response": "🎥 Here's [your video]({link})!\n\n<code>{title}</code>",
-        "default_music_response": "🎵 <b>Audio ready!</b>\n\n<code>{title}</code>",
-        "default_channel": "📺 Channel: <code>{channel}</code>",
+        "default_response": "{site} Here's [your video]({link})!\n\n<code>{title}</code>",
+        "default_music_response": "🎵 <b>Audio ready!</b> [link]({link})\n\n<code>{title}</code>",
+        "default_channel": "<tg-emoji emoji-id=\"5886412370347036129\">👤</tg-emoji> Channel: <code>{channel}</code>",
         "downloading_audio": "🎵 <b>Downloading audio...</b>",
         "done_fallback": "Done!",
         "method_proxy": "proxy",
         "method_cookies": "cookies",
         "method_direct": "direct",
+        "cookies_required_error": "❌ <b>Cookies error.</b> Please add cookies via <code>.cfg YouTube-DLD youtube_cookies</code>.",
         "supported_sites": """🎥 <b>Supported sites:</b>
 
-🔴 <b>YouTube</b> — youtube.com, youtu.be, music.youtube.com
-🎵 <b>TikTok</b> — tiktok.com, vt.tiktok.com, vm.tiktok.com
-📸 <b>Instagram</b> — instagram.com
-🐦 <b>X (Twitter)</b> — x.com, twitter.com
-👥 <b>Facebook</b> — facebook.com
-🎬 <b>Vimeo</b> — vimeo.com
-📺 <b>Twitch</b> — twitch.tv
-🤖 <b>Reddit</b> — reddit.com
+<tg-emoji emoji-id="5355235592844095825">🔴</tg-emoji> <b>YouTube</b> — youtube.com, youtu.be, music.youtube.com
+<tg-emoji emoji-id="5353034628263330616">🎵</tg-emoji> <b>TikTok</b> — tiktok.com, vt.tiktok.com, vm.tiktok.com
+<tg-emoji emoji-id="5355097780228470775">📸</tg-emoji> <b>Instagram</b> — instagram.com
+<tg-emoji emoji-id="5355148941878900494">🐦</tg-emoji> <b>X (Twitter)</b> — x.com, twitter.com
+<tg-emoji emoji-id="5355254460635428635">👥</tg-emoji> <b>Facebook</b> — facebook.com
+<tg-emoji emoji-id="5334764984142412896">🎬</tg-emoji> <b>Vimeo</b> — vimeo.com
+<tg-emoji emoji-id="5352759664457038886">🎮</tg-emoji> <b>Twitch</b> — twitch.tv
+<tg-emoji emoji-id="5352531593103686999">👽</tg-emoji> <b>Reddit</b> — reddit.com
 
 <b>🎵 Music:</b>
-▫️ <b>Yandex Music</b> — music.yandex.ru
-▫️ <b>SoundCloud</b> — soundcloud.com
-▫️ <b>Bandcamp</b> — bandcamp.com
-▫️ <b>Spotify</b> — spotify.com
+<tg-emoji emoji-id="5346296430166293639">🎧</tg-emoji> <b>Yandex Music</b> — music.yandex.ru
+<tg-emoji emoji-id="5345844509412444249">☁️</tg-emoji> <b>SoundCloud</b> — soundcloud.com
+<tg-emoji emoji-id="5451966206334513619">🎸</tg-emoji> <b>Bandcamp</b> — bandcamp.com
+<tg-emoji emoji-id="5346074681004801565">🟢</tg-emoji> <b>Spotify</b> — spotify.com
 
 <b>🇷🇺 Russian:</b>
-▫️ <b>RuTube</b> — rutube.ru
-▫️ <b>VK</b> — vk.com
-▫️ <b>Odnoklassniki</b> — ok.ru
+<tg-emoji emoji-id="5298747646096187189">▶️</tg-emoji> <b>RuTube</b> — rutube.ru
+<tg-emoji emoji-id="5278229754099540071">🔵</tg-emoji> <b>VK</b> — vk.com
+<tg-emoji emoji-id="5310076528577491230">🟠</tg-emoji> <b>Odnoklassniki</b> — ok.ru
+
+Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md">here</a>.
 
 <b>📝 Commands:</b>
 ▫️ .dlvideo <link> — download video
 ▫️ .dlvideo -a <link> — download audio
+▫️ .dlvideo -s 1:30 -e 5:00 <link> — just a clip (-e is optional)
 ▫️ .dvlist — list of supported sites
-▫️ .sblock — SponsorBlock settings (inline menu)""",
+▫️ .sblock — SponsorBlock settings (inline menu)
+▫️ .dlvo — same as .dlvideo, but with voice-over translation""",
         "sb_state_on": "enabled ✅",
         "sb_state_off": "disabled 🚫",
         "sb_main_text": "✂️ <b>SponsorBlock</b> — {state}\n\n✅ — will be cut on download, ❌ — stays in the video.\nThe item with ⚙️ has its own extra settings.",
@@ -402,6 +910,8 @@ class YouTube_DLDMod(loader.Module):
         "sb_music_only_btn": "Only on music.youtube.com",
         "sb_back": "◀️ Back",
         "sb_saved": "Saved",
+        "vo_translating": "🗣 <b>Translating voice-over...</b>\n\n<i>Not instant, can take a couple of minutes.</i>",
+        "vo_failed": "⚠️ Voice-over failed: <code>{error}</code>\n\nSending the video without translation...",
         "cat_sponsor": "📢 Sponsor",
         "cat_interaction": "🔔 Subscribe reminder",
         "cat_selfpromo": "🎗 Self-promo",
@@ -521,14 +1031,14 @@ class YouTube_DLDMod(loader.Module):
                 "🍪 Куки YouTube в формате Netscape (ТЕКСТОМ!)\n\n"
                 "⚠️ ВАЖНО: Если твой Heroku сервер во Франции/UK - экспортируй куки через VPN той же страны!\n\n"
                 "Как получить:\n"
-                "1. Подключись к VPN страны где твой сервер (узнай регион Heroku)\n"
-                "2. Приватное окно → залогинься на YouTube\n"
+                "1. Подключись к VPN страны где твой сервер (не обязательно)\n"
+                "2. Открой приватное окно в браузере → залогинься на YouTube\n"
                 "3. Перейди на youtube.com/robots.txt\n"
-                "4. Cookie-Editor → Export → Netscape\n"
+                "4. <a href='https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm'>Cookie-Editor</a> → Export → Netscape\n"
                 "5. СРАЗУ закрой окно\n"
-                "6. Вставь ВЕСЬ текст сюда (БЕЗ кавычек)\n\n"
+                "6. Вставь ВЕСЬ текст сюда из файла\n\n"
                 "Начинается с: # Netscape HTTP Cookie File",
-                validator=loader.validators.String(),
+                validator=loader.validators.Hidden(),
             ),
             loader.ConfigValue(
                 "proxy",
@@ -537,14 +1047,21 @@ class YouTube_DLDMod(loader.Module):
                 "Форматы:\n"
                 "• HTTP: http://user:pass@host:port\n"
                 "• SOCKS5: socks5://host:port\n\n"
+                "Пусто — прокси не используется. Заполнено — пробуем через прокси, затем куки, затем напрямую.\n\n"
                 "⚠️ Trojan/VLESS не поддерживаются!",
-                validator=loader.validators.String(),
+                validator=loader.validators.Hidden(),
             ),
             loader.ConfigValue(
                 "max_attempts",
+                10,
+                "Максимум попыток (1-10)",
+                validator=loader.validators.Integer(minimum=1, maximum=10),
+            ),
+            loader.ConfigValue(
+                "vo_orig_volume",
                 50,
-                "Максимум попыток (1-100)",
-                validator=loader.validators.Integer(minimum=1, maximum=100),
+                "🔊 Громкость оригинальной озвучки при переводе (0-100%), пока идёт перевод поверх",
+                validator=loader.validators.Integer(minimum=0, maximum=100),
             ),
         )
 
@@ -670,22 +1187,38 @@ class YouTube_DLDMod(loader.Module):
 
     @loader.command()
     async def dlvideo(self, message):
-        """Скачать видео или аудио по ссылке (или в ответ на сообщение со ссылкой)"""
-        args = utils.get_args_raw(message)
+        """Скачать видео/аудио по ссылке. -a аудио, -s/-e начало/конец отрезка"""
+        await self._dlvideo_impl(message, force_translate=False)
+
+    @loader.command()
+    async def dlvo(self, message):
+        """То же самое что .dlvideo (те же флаги -a/-s/-e), но с переводом озвучки"""
+        await self._dlvideo_impl(message, force_translate=True)
+
+    async def _dlvideo_impl(self, message, force_translate=False):
+        args_raw = utils.get_args_raw(message)
         reply = await message.get_reply_message()
 
-        audio_only = False
-        if args and args.startswith(('-a', '-audio', '--audio')):
-            audio_only = True
-            args = args.split(maxsplit=1)[1] if len(args.split(maxsplit=1)) > 1 else ""
+        parsed = parse_dlvideo_args(args_raw)
+        audio_only = parsed["audio_only"]
+        start_time = parsed["start"]
+        end_time = parsed["end"]
 
-        link = extract_video_link(args) if args else None
+        link = find_video_link_in_message(message)
         if not link and reply:
-            link = extract_video_link(reply.raw_text)
+            link = find_video_link_in_message(reply)
 
         if not link:
             await utils.answer(message, self.strings["no_link"])
             return
+
+        if start_time is None:
+            url_timecode = extract_url_timecode(link)
+            if url_timecode is not None:
+                start_time = url_timecode
+
+        if start_time is not None and end_time is not None and end_time <= start_time:
+            end_time = None
 
         if audio_only:
             status_msg = await utils.answer(message, self.strings("downloading_audio"))
@@ -694,6 +1227,7 @@ class YouTube_DLDMod(loader.Module):
 
         cookies = self.config["youtube_cookies"].strip() if self.config["youtube_cookies"] else None
         proxy = self.config["proxy"].strip() if self.config["proxy"] else None
+        is_tiktok = "tiktok.com" in link.lower()
         deno = self.get("deno_source") if self.get("deno_source") not in ["install_failed", None] else None
         max_attempts = self.config["max_attempts"]
 
@@ -724,40 +1258,181 @@ class YouTube_DLDMod(loader.Module):
                     pass
 
         try:
-            media, title, channel = await download_media(
-                link,
-                cookies_text=cookies,
-                proxy=proxy,
-                deno_path=deno,
-                max_attempts=max_attempts,
-                audio_only=audio_only,
-                sponsorblock_categories=sb_categories,
-                on_attempt=update_status,
-            )
+            tiktok_slideshow = None
+            if is_tiktok and not audio_only and not force_translate:
+                try:
+                    tiktok_slideshow = await download_tiktok_slideshow(link, utils.get_base_dir())
+                except Exception:
+                    tiktok_slideshow = None
+
+            if tiktok_slideshow:
+                image_paths, audio_path, title, channel, _ = tiktok_slideshow
+
+                async def send_album_fallback(files, cap):
+                    try:
+                        await utils.answer_file(
+                            status_msg, files, caption=cap, parse_mode="HTML",
+                            reply_to=reply or message, silent=True,
+                        )
+                    except TypeError as silent_err:
+                        if "silent" not in str(silent_err):
+                            raise
+                        await utils.answer_file(
+                            status_msg, files, caption=cap, parse_mode="HTML",
+                            reply_to=reply or message,
+                        )
+
+                try:
+                    caption = convert_markdown_to_html(self.config["response_text"], link)
+                    caption = caption.replace("{title}", title or "")
+                    caption = caption.replace("{site}", get_site_emoji_html(link))
+                    if self.config["show_channel"] and channel:
+                        channel_text = self.config["channel_text"].replace("{channel}", channel)
+                        caption += f"\n\n{channel_text}"
+
+                    reply_target = reply or message
+                    reply_to_id = reply_target.id if reply_target else None
+                    slideshow_caption = None if audio_path else caption
+
+                    try:
+                        await send_tiktok_rich_slideshow(
+                            message.client, message.chat_id, image_paths, slideshow_caption, reply_to_id
+                        )
+                    except Exception:
+                        chunks = [image_paths[i:i + 10] for i in range(0, len(image_paths), 10)]
+                        for idx, chunk in enumerate(chunks):
+                            fallback_cap = None
+                            if not audio_path and idx == len(chunks) - 1:
+                                fallback_cap = caption
+                            await send_album_fallback(chunk, fallback_cap)
+
+                    if audio_path:
+                        await send_album_fallback(audio_path, caption)
+
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                finally:
+                    for path in image_paths:
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                    if audio_path:
+                        try:
+                            os.remove(audio_path)
+                        except Exception:
+                            pass
+
+                return
+
+            media = title = channel = source_lang = None
+            last_err = None
+            for attempt_idx in range(2):
+                try:
+                    media, title, channel, source_lang = await download_media(
+                        link,
+                        cookies_text=cookies,
+                        proxy=proxy,
+                        deno_path=deno,
+                        max_attempts=max_attempts,
+                        audio_only=audio_only,
+                        sponsorblock_categories=sb_categories,
+                        start_time=start_time,
+                        end_time=end_time,
+                        on_attempt=update_status,
+                    )
+                except Exception as primary_err:
+                    last_err = primary_err
+                    media = None
+                    if is_tiktok and not audio_only:
+                        try:
+                            media, title, channel = await download_tiktok_via_api(link, utils.get_base_dir())
+                            source_lang = None
+                        except Exception:
+                            media = None
+
+                if media and os.path.isfile(media) and os.path.getsize(media) > 0:
+                    break
+                media = None
+
+            if not media:
+                raise last_err or Exception(self.strings("done_fallback"))
+
+            translation_marker = ""
+            if force_translate and not audio_only:
+                try:
+                    try:
+                        await status_msg.edit(self.strings("vo_translating"))
+                    except Exception:
+                        pass
+                    ub_lang_raw = (self.db.get("heroku.translations", "lang", "en") or "en").strip().lower()
+                    ub_lang_code = ub_lang_raw.split()[0] if ub_lang_raw else "en"
+                    vo_lang = "ru" if ub_lang_code in ("ru", "uk", "ua") else "en"
+                    audio_url, _ = await get_translated_audio(link, response_lang=vo_lang)
+                    media = await mux_translated_audio(media, audio_url, orig_volume_percent=self.config["vo_orig_volume"])
+                    translation_marker = f"🌐 {lang_display(source_lang)} ➔ {lang_display(vo_lang)}\n"
+                except Exception as vo_err:
+                    logger.warning(f"VOT translation failed: {vo_err}")
+                    try:
+                        await status_msg.edit(self.strings("vo_failed").replace("{error}", str(vo_err)))
+                        await asyncio.sleep(3)
+                    except Exception:
+                        pass
+
+            if not (media and os.path.isfile(media) and os.path.getsize(media) > 0):
+                raise Exception(self.strings("done_fallback"))
+
+            clip_marker = ""
+            if start_time is not None or end_time is not None:
+                clip_marker = f" ✂️({format_seconds(start_time or 0)}-{format_seconds(end_time) if end_time is not None else '…'})"
 
             if audio_only:
-                caption = self.config["music_response_text"].replace("{title}", title or "")
+                caption = convert_markdown_to_html(self.config["music_response_text"], link)
+                caption = caption.replace("{title}", title or "")
             else:
                 if self.config["show_link"]:
                     caption_template = self.config["response_text"]
                     caption = convert_markdown_to_html(caption_template, link)
                     caption = caption.replace("{title}", title or "")
+                    caption = caption.replace("{site}", get_site_emoji_html(link))
+
+                    if translation_marker:
+                        lines = caption.split("\n", 1)
+                        lines[0] = translation_marker + lines[0]
+                        caption = "\n".join(lines)
+
+                    if clip_marker:
+                        lines = caption.split("\n", 1)
+                        lines[0] = lines[0] + clip_marker
+                        caption = "\n".join(lines)
 
                     if self.config["show_channel"] and channel:
                         channel_text = self.config["channel_text"].replace("{channel}", channel)
                         caption += f"\n\n{channel_text}"
                 else:
-                    caption = title or self.strings("done_fallback")
+                    caption = (translation_marker + (title or self.strings("done_fallback"))) + clip_marker
 
-            await utils.answer_file(
-                status_msg,
-                media,
-                caption=caption,
-                parse_mode="HTML",
-                reply_to=reply or message,
-                silent=True,
-                voice=False
-            )
+            try:
+                await utils.answer_file(
+                    status_msg,
+                    media,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_to=reply or message,
+                    silent=True,
+                )
+            except TypeError as silent_err:
+                if "silent" not in str(silent_err):
+                    raise
+                await utils.answer_file(
+                    status_msg,
+                    media,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_to=reply or message,
+                )
 
             try:
                 await status_msg.delete()
@@ -769,7 +1444,11 @@ class YouTube_DLDMod(loader.Module):
                 pass
 
         except Exception as e:
-            error_msg = self.config["error_text"].replace("{attempts}", str(progress["attempt"])).replace("{error}", str(e))
+            error_str = str(e)
+            if "sign in to confirm" in error_str.lower() or "confirm you" in error_str.lower():
+                error_msg = self.strings("cookies_required_error")
+            else:
+                error_msg = self.config["error_text"].replace("{attempts}", str(progress["attempt"])).replace("{error}", str(e))
             await utils.answer(status_msg, error_msg)
             try:
                 if 'media' in locals():
