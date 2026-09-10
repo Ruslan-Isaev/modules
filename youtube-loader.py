@@ -3,7 +3,7 @@
 # meta pic: https://kappa.lol/21nHvy
 # requires: yt_dlp aiohttp aiofiles mutagen
 
-__version__ = (3, 4, 7)
+__version__ = (3, 4, 8)
 
 import yt_dlp
 import uuid
@@ -234,6 +234,7 @@ def extract_video_link(text):
         r"(https?://)?(www\.)?streamable\.com/[^\s]+",
         r"(https?://)?(music\.)?yandex\.(ru|com|by|kz|ua)/album/[^\s]+",
         r"(https?://)?(music\.)?yandex\.(ru|com|by|kz|ua)/track/[^\s]+",
+        r"(https?://)?(music\.)?yandex\.(ru|com|by|kz|ua)/(users/[^\s]+/)?playlists/[^\s]+",
         r"(https?://)?(www\.)?soundcloud\.com/[^\s]+",
         r"(https?://)?(www\.)?bandcamp\.com/[^\s]+",
         r"(https?://)?(www\.)?mixcloud\.com/[^\s]+",
@@ -1586,6 +1587,9 @@ YANDEX_MUSIC_ALBUM_RE = re.compile(
 YANDEX_MUSIC_PLAYLIST_RE = re.compile(
     r"music\.yandex\.(?:ru|com|by|kz|ua)/users/([^/]+)/playlists/(\d+)", re.IGNORECASE
 )
+YANDEX_MUSIC_PLAYLIST_UUID_RE = re.compile(
+    r"music\.yandex\.(?:ru|com|by|kz|ua)/playlists/([0-9a-fA-F-]{36})", re.IGNORECASE
+)
 
 
 def extract_yandex_track_id(url):
@@ -1610,6 +1614,11 @@ def extract_yandex_album_id(url):
 def extract_yandex_playlist(url):
     m = YANDEX_MUSIC_PLAYLIST_RE.search(url or "")
     return (m.group(1), m.group(2)) if m else None
+
+
+def extract_yandex_playlist_uuid(url):
+    m = YANDEX_MUSIC_PLAYLIST_UUID_RE.search(url or "")
+    return m.group(1) if m else None
 
 
 def parse_netscape_cookies(cookies_text, domain_filter=None):
@@ -2103,6 +2112,26 @@ async def fetch_yandex_playlist_tracks(user, kind, cookies_text=None):
         if not track_ids:
             raise ValueError("В плейлисте нет треков")
         title = result.get("title") or f"Playlist {kind}"
+        owner = result.get("owner") or {}
+        artists = owner.get("name") or owner.get("login") or ""
+        cover_bytes = await _yandex_download_cover(session, result.get("coverUri") or result.get("ogImage"))
+        return title, artists, track_ids, cover_bytes
+
+
+async def fetch_yandex_playlist_by_uuid(playlist_uuid, cookies_text=None):
+    headers = await _yandex_api_headers(cookies_text)
+    url = f"https://api.music.yandex.ru/playlist/{playlist_uuid}"
+    async with aiohttp.ClientSession() as session:
+        status, data = await _yandex_get_json(session, url, headers)
+        if status != 200 or not isinstance(data, dict):
+            raise ValueError(
+                "Не удалось получить плейлист. Обновите куки music.yandex.ru (нужен Session_id)"
+            )
+        result = data.get("result") or {}
+        track_ids = _yandex_collect_track_ids(result)
+        if not track_ids:
+            raise ValueError("В плейлисте нет треков")
+        title = result.get("title") or "Playlist"
         owner = result.get("owner") or {}
         artists = owner.get("name") or owner.get("login") or ""
         cover_bytes = await _yandex_download_cover(session, result.get("coverUri") or result.get("ogImage"))
@@ -2697,7 +2726,7 @@ def convert_markdown_to_html(template: str, link: str) -> str:
 class YouTube_DLDMod(loader.Module):
     """Помогает скачивать видео с YouTube, TikTok и др. SponsorBlock вырезает рекламу, -s/-e берут только отрезок."""
 
-    __version__ = (3, 4, 7)
+    __version__ = (3, 4, 8)
 
     strings = {
         "name": "YouTube-DLD",
@@ -3822,6 +3851,7 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
         yandex_track_id = extract_yandex_track_id(link)
         yandex_album_id = extract_yandex_album_id(link)
         yandex_playlist = extract_yandex_playlist(link)
+        yandex_playlist_uuid = extract_yandex_playlist_uuid(link)
         deno = self.get("deno_source") if self.get("deno_source") not in ["install_failed", None] else None
         max_attempts = MAX_DOWNLOAD_ATTEMPTS
 
@@ -4035,7 +4065,7 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
 
                 return
 
-            if yandex_track_id or yandex_album_id or yandex_playlist:
+            if yandex_track_id or yandex_album_id or yandex_playlist or yandex_playlist_uuid:
                 try:
                     collection_title = None
                     collection_artists = ""
@@ -4047,9 +4077,13 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
                         collection_title, collection_artists, track_ids, collection_cover = await fetch_yandex_album_tracks(
                             yandex_album_id, cookies_text=cookies
                         )
-                    else:
+                    elif yandex_playlist:
                         collection_title, collection_artists, track_ids, collection_cover = await fetch_yandex_playlist_tracks(
                             yandex_playlist[0], yandex_playlist[1], cookies_text=cookies
+                        )
+                    else:
+                        collection_title, collection_artists, track_ids, collection_cover = await fetch_yandex_playlist_by_uuid(
+                            yandex_playlist_uuid, cookies_text=cookies
                         )
 
                     total_n = len(track_ids)
