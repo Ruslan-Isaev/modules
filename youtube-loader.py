@@ -3,7 +3,7 @@
 # meta pic: https://kappa.lol/21nHvy
 # requires: yt_dlp aiohttp aiofiles mutagen
 
-__version__ = (3, 4, 6)
+__version__ = (3, 4, 7)
 
 import yt_dlp
 import uuid
@@ -35,18 +35,20 @@ from telethon.tl.types import MessageEntityTextUrl
 from telethon.tl import types as tl_types
 from telethon.tl.custom import Message
 from telethon import utils as tl_utils
-from herokutl.tl.functions.messages import SendMessageRequest, UploadMediaRequest, UpdatePinnedMessageRequest, GetPeerDialogsRequest
+from herokutl.tl.functions.messages import SendMessageRequest, UploadMediaRequest, UpdatePinnedMessageRequest, GetPeerDialogsRequest, SendMultiMediaRequest
 from herokutl.tl.functions.account import UpdateNotifySettingsRequest, GetNotifySettingsRequest
 from herokutl.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeFilename,
     InputDialogPeer,
+    InputMediaUploadedDocument,
     InputMediaUploadedPhoto,
     InputNotifyPeer,
     InputPeerNotifySettings,
     InputPhoto,
     InputReplyToMessage,
     InputRichMessage,
+    InputSingleMedia,
     PageBlockPhoto,
     PageBlockSlideshow,
     PageCaption,
@@ -54,6 +56,7 @@ from herokutl.tl.types import (
     TextPlain,
 )
 from herokutl.extensions import html as herokutl_html
+from herokutl import utils as herokutl_utils
 from .. import loader, utils
 import logging
 
@@ -81,12 +84,47 @@ EMOJI_PHOTO = "<tg-emoji emoji-id=5766879414704935108>🖼</tg-emoji>"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def clean_error_text(text):
+def redact_secrets(text, cookies_text=None, proxy=None):
+    """Вычищает из пользовательских сообщений значения кук/прокси."""
+    if not text:
+        return text
+    out = str(text)
+    secrets = []
+    if proxy:
+        secrets.append(str(proxy).strip())
+    if cookies_text:
+        for line in str(cookies_text).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t") if "\t" in line else line.split()
+            if len(parts) >= 7:
+                secrets.append(parts[6])
+            elif len(parts) >= 2 and "=" not in parts[0]:
+                secrets.append(parts[-1])
+        blob = str(cookies_text).strip()
+        if len(blob) > 24:
+            secrets.append(blob)
+    for s in sorted({x for x in secrets if x and len(x) >= 6}, key=len, reverse=True):
+        out = out.replace(s, "•••")
+    return out
+
+
+def clean_error_text(text, cookies_text=None, proxy=None):
     text = ANSI_RE.sub("", str(text))
     text = re.sub(r"^ERROR:\s*", "", text.strip())
     text = re.sub(r"^\[\w+\]\s*[\w.-]+:\s*", "", text)
     text = re.sub(r":\s+", ":\n", text)
+    text = re.sub(r"(https?://[^:\s/]+:)[^@\s/]+@", r"\1•••@", text)
+    text = re.sub(r"(socks5?://[^:\s/]+:)[^@\s/]+@", r"\1•••@", text)
+    text = re.sub(
+        r"(?i)\b(session_id|sessionid2|sid|psuid|yandexuid|auth_token|login_info|SAPISID|HSID|SSID|APISID|SIDCC)=[^\s;\"']+",
+        r"\1=•••",
+        text,
+    )
+    text = redact_secrets(text, cookies_text=cookies_text, proxy=proxy)
     return text.strip()
+
 
 
 def cookies_error_message(site_name, robots_url, detail):
@@ -130,6 +168,14 @@ COOKIE_DOMAIN_GROUPS = [
     ("instagram", ("instagram.com",)),
     ("twitter", ("twitter.com", "x.com")),
 ]
+
+
+def config_cookies_text(cfg_val):
+    if not cfg_val:
+        return ""
+    if isinstance(cfg_val, (list, tuple)):
+        return clean_cookies_text("\n".join(str(x) for x in cfg_val if x))
+    return clean_cookies_text(str(cfg_val))
 
 
 def clean_cookies_text(raw_text):
@@ -181,7 +227,7 @@ def extract_video_link(text):
         r"(https?://)?(www\.)?instagram\.com/(p|reel|tv)/[^\s]+",
         r"(https?://)?(www\.)?(twitter\.com|x\.com)/[^\s]+/status/[^\s]+",
         r"(https?://)?(www\.)?facebook\.com/[^\s]+/videos/[^\s]+",
-        r"(https?://)?(www\.)?reddit\.com/r/[^\s]+/comments/[^\s]+",
+        r"(https?://)?(www\.)?reddit\.com/r/[^\s]+/(comments|s)/[^\s]+",
         r"(https?://)?(www\.)?vimeo\.com/[^\s]+",
         r"(https?://)?(www\.)?dailymotion\.com/video/[^\s]+",
         r"(https?://)?(www\.)?twitch\.tv/(videos/|clip/|[^/]+$)[^\s]*",
@@ -1873,67 +1919,309 @@ async def download_yandex_music_track(url, output_dir, cookies_text=None, prefer
     return out_path, title, artist, album, duration_sec, cover_bytes, meta_debug
 
 
-async def _yandex_api_headers(cookies_text):
+async def _yandex_cookie_header(cookies_text):
     yandex_cookies = parse_netscape_cookies(cookies_text, domain_filter="yandex")
     if not yandex_cookies:
         raise ValueError(
             "Нужны куки залогиненного аккаунта music.yandex.ru — добавьте их в youtube_cookies"
         )
-    cookie_header = "; ".join(f"{k}={v}" for k, v in yandex_cookies.items())
-    return {
+    return yandex_cookies, "; ".join(f"{k}={v}" for k, v in yandex_cookies.items())
+
+
+async def _yandex_oauth_from_cookies(cookies_text):
+    yandex_cookies, cookie_header = await _yandex_cookie_header(cookies_text)
+    session_id = yandex_cookies.get("Session_id") or yandex_cookies.get("sessionid2")
+    if not session_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://mobileproxy.passport.yandex.net/1/bundle/oauth/token_by_sessionid",
+                data={
+                    "client_id": "c0ebe342af7d48fbbbfcf2d2eedb8f9e",
+                    "client_secret": "ad0a908f0aa341a182a37ecd75bc319e",
+                },
+                headers={
+                    "Ya-Client-Host": "passport.yandex.ru",
+                    "Ya-Client-Cookie": f"Session_id={session_id}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+            x_token = (data or {}).get("access_token")
+            if not x_token:
+                return None
+            async with session.post(
+                "https://oauth.mobile.yandex.net/1/token",
+                data={
+                    "client_id": "23cabbbdc6cd418abb4b39c32c41195d",
+                    "client_secret": "53bc75238f0c4d08a118e51fe9203300",
+                    "grant_type": "x-token",
+                    "access_token": x_token,
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp2:
+                if resp2.status != 200:
+                    return x_token
+                data2 = await resp2.json(content_type=None)
+            return (data2 or {}).get("access_token") or x_token
+    except Exception:
+        return None
+
+
+async def _yandex_api_headers(cookies_text):
+    _, cookie_header = await _yandex_cookie_header(cookies_text)
+    headers = {
         "x-yandex-music-client": "YandexMusicWebNext/1.0.0",
         "x-yandex-music-without-invocation-info": "1",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://music.yandex.ru/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Cookie": cookie_header,
     }
+    oauth = await _yandex_oauth_from_cookies(cookies_text)
+    if oauth:
+        headers["Authorization"] = f"OAuth {oauth}"
+    return headers
+
+
+def _yandex_artists_line(obj):
+    if not isinstance(obj, dict):
+        return ""
+    names = [a.get("name", "") for a in (obj.get("artists") or []) if isinstance(a, dict) and a.get("name")]
+    return ", ".join(names)
+
+
+def _yandex_collect_track_ids(result):
+    track_ids = []
+    if not isinstance(result, dict):
+        return track_ids
+    for vol in (result.get("volumes") or []):
+        for t in (vol or []):
+            if isinstance(t, dict):
+                tid = t.get("id") or t.get("realId")
+                if tid is not None:
+                    track_ids.append(str(tid))
+    if track_ids:
+        return track_ids
+    for t in (result.get("tracks") or []):
+        if not isinstance(t, dict):
+            continue
+        track = t.get("track") if isinstance(t.get("track"), dict) else t
+        tid = track.get("id") or track.get("realId")
+        if tid is not None:
+            track_ids.append(str(tid))
+    return track_ids
+
+
+async def _yandex_get_json(session, url, headers):
+    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        body = await resp.text()
+        status = resp.status
+    try:
+        return status, json.loads(body)
+    except Exception:
+        return status, None
+
+
+async def _yandex_download_cover(session, cover_uri):
+    if not cover_uri:
+        return None
+    try:
+        url = "https://" + str(cover_uri).replace("%%", "400x400")
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                return await resp.read()
+    except Exception:
+        pass
+    return None
 
 
 async def fetch_yandex_album_tracks(album_id, cookies_text=None):
     headers = await _yandex_api_headers(cookies_text)
-    url = f"https://api.music.yandex.ru/albums/{album_id}/with-tracks"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status != 200:
-                raise ValueError(f"Яндекс.Музыка album API {resp.status}")
-            data = await resp.json(content_type=None)
-    result = data.get("result") if isinstance(data, dict) else data
-    if not result:
-        raise ValueError("Пустой ответ album API")
-    title = result.get("title") or f"Album {album_id}"
-    volumes = result.get("volumes") or []
-    track_ids = []
-    for vol in volumes:
-        for t in (vol or []):
-            tid = str((t or {}).get("id") or "")
-            if tid:
+        for url in (
+            f"https://api.music.yandex.ru/albums/{album_id}/with-tracks",
+            f"https://api.music.yandex.ru/albums/{album_id}",
+        ):
+            status, data = await _yandex_get_json(session, url, headers)
+            if status != 200 or not isinstance(data, dict):
+                continue
+            result = data.get("result", data)
+            track_ids = _yandex_collect_track_ids(result)
+            if track_ids:
+                title = (result.get("title") if isinstance(result, dict) else None) or f"Album {album_id}"
+                artists = _yandex_artists_line(result if isinstance(result, dict) else {})
+                cover_bytes = await _yandex_download_cover(
+                    session, result.get("coverUri") if isinstance(result, dict) else None
+                )
+                return title, artists, track_ids, cover_bytes
+
+        page_url = f"https://music.yandex.ru/album/{album_id}"
+        try:
+            async with session.get(
+                page_url,
+                headers={
+                    "User-Agent": headers.get("User-Agent", "Mozilla/5.0"),
+                    "Cookie": headers.get("Cookie", ""),
+                    "Referer": "https://music.yandex.ru/",
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                html = await resp.text()
+        except Exception:
+            html = ""
+        html_ids = re.findall(r'"id"\s*:\s*"?(\d{5,})"?\s*,\s*"realId"', html) or re.findall(r'/track/(\d+)', html)
+        seen, track_ids = set(), []
+        for tid in html_ids:
+            if tid != str(album_id) and tid not in seen:
+                seen.add(tid)
                 track_ids.append(tid)
-    if not track_ids:
-        raise ValueError("В альбоме нет треков")
-    return title, track_ids
+        if track_ids:
+            return f"Album {album_id}", "", track_ids, None
+
+    raise ValueError(
+        "Не удалось получить треки альбома. Обновите куки music.yandex.ru "
+        "(нужен Session_id; для списка треков требуется авторизация)"
+    )
 
 
 async def fetch_yandex_playlist_tracks(user, kind, cookies_text=None):
     headers = await _yandex_api_headers(cookies_text)
     url = f"https://api.music.yandex.ru/users/{urllib.parse.quote(user)}/playlists/{kind}"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status != 200:
-                raise ValueError(f"Яндекс.Музыка playlist API {resp.status}")
-            data = await resp.json(content_type=None)
-    result = data.get("result") if isinstance(data, dict) else data
-    if not result:
-        raise ValueError("Пустой ответ playlist API")
-    title = result.get("title") or f"Playlist {kind}"
-    track_ids = []
-    for item in (result.get("tracks") or []):
-        track = (item or {}).get("track") or item or {}
-        tid = str(track.get("id") or "")
-        if tid:
-            track_ids.append(tid)
-    if not track_ids:
-        raise ValueError("В плейлисте нет треков")
-    return title, track_ids
+        status, data = await _yandex_get_json(session, url, headers)
+        if status != 200 or not isinstance(data, dict):
+            raise ValueError(
+                "Не удалось получить плейлист. Обновите куки music.yandex.ru (нужен Session_id)"
+            )
+        result = data.get("result") or {}
+        track_ids = _yandex_collect_track_ids(result)
+        if not track_ids:
+            raise ValueError("В плейлисте нет треков")
+        title = result.get("title") or f"Playlist {kind}"
+        owner = result.get("owner") or {}
+        artists = owner.get("name") or owner.get("login") or ""
+        cover_bytes = await _yandex_download_cover(session, result.get("coverUri") or result.get("ogImage"))
+        return title, artists, track_ids, cover_bytes
+
+
+async def _yandex_stamp_cover(path, cover_bytes):
+    """Вшивает обложку в mp3/flac. Сначала ffmpeg (как в Telegram/проводнике), иначе mutagen."""
+    if not path or not cover_bytes or not os.path.isfile(path):
+        return
+    cover_path = path + ".cover.jpg"
+    out_path = path + ".covtmp" + os.path.splitext(path)[1]
+    try:
+        async with aiofiles.open(cover_path, "wb") as cf:
+            await cf.write(cover_bytes)
+        is_mp3 = path.lower().endswith(".mp3")
+        cmd = [
+            "ffmpeg", "-y", "-i", path, "-i", cover_path,
+            "-map", "0:a", "-map", "1", "-c", "copy",
+        ]
+        if is_mp3:
+            cmd += ["-id3v2_version", "3"]
+        cmd += [
+            "-metadata:s:v", "title=Album cover",
+            "-metadata:s:v", "comment=Cover (front)",
+            "-disposition:v:0", "attached_pic",
+            out_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            proc = None
+        if proc is not None and proc.returncode == 0 and os.path.isfile(out_path):
+            os.replace(out_path, path)
+            return
+        logger.warning(
+            f"Yandex cover stamp: ffmpeg mux failed (code={proc.returncode if proc else 'timeout'}) "
+            f"for {os.path.basename(path)}, falling back to mutagen"
+        )
+        if path.lower().endswith(".flac"):
+            tags = FLAC(path)
+            pic = FlacPicture()
+            pic.data = cover_bytes
+            pic.type = 3
+            pic.mime = "image/jpeg"
+            tags.clear_pictures()
+            tags.add_picture(pic)
+            tags.save()
+        else:
+            try:
+                tags = ID3(path)
+            except ID3NoHeaderError:
+                tags = ID3()
+            tags.delall("APIC")
+            tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
+            tags.save(path)
+    except Exception as e:
+        logger.warning(f"Yandex cover stamp failed: {e}")
+    finally:
+        for p in (cover_path, out_path):
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+async def _send_audio_album(client, entity, items, reply_to_id=None, silent=True):
+    """Настоящий Telegram-альбом (messages.sendMultiMedia) с превью и атрибутами НА КАЖДОМ
+    файле — одним чанком (до 10 штук). utils.answer_file/send_file с файлом-списком уходит в
+    herokutl _send_album, а та не прокидывает thumb/attributes ни в один файл пачки, кроме
+    случая одиночной отправки — поэтому в обычном пачечном send'е обложка и не показывалась
+    нигде, кроме последнего трека, отправленного отдельным вызовом. Тут каждый файл проходит
+    через client._file_to_media(..., attributes=, thumb=) индивидуально (ровно то же самое,
+    что делает официальный клиент при перетаскивании нескольких файлов), и только потом всё
+    собирается в один messages.sendMultiMedia. items: [{"path", "attributes", "thumb",
+    "caption"}, ...] (caption обычно только у последнего)."""
+    input_entity = await client.get_input_entity(entity)
+    media_list = []
+    for item in items:
+        fh, fm, _ = await client._file_to_media(
+            item["path"],
+            attributes=item.get("attributes"),
+            thumb=item.get("thumb"),
+        )
+        if isinstance(fm, InputMediaUploadedDocument):
+            uploaded = await client(UploadMediaRequest(input_entity, media=fm))
+            fm = herokutl_utils.get_input_media(uploaded.document)
+        caption_html = item.get("caption") or ""
+        if caption_html:
+            caption_text, entities = await client._parse_message_text(caption_html, "HTML")
+        else:
+            caption_text, entities = "", None
+        media_list.append(InputSingleMedia(fm, message=caption_text, entities=entities))
+    request = SendMultiMediaRequest(
+        input_entity,
+        reply_to=InputReplyToMessage(reply_to_id) if reply_to_id else None,
+        multi_media=media_list,
+        silent=silent,
+    )
+    return await client(request)
+
+
+def _ru_track_word(n):
+    if n % 10 == 1 and n % 100 != 11:
+        return "трек"
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return "трека"
+    return "треков"
+
 
 
 async def download_yandex_track_by_id(track_id, output_dir, cookies_text=None, prefer_flac=False):
@@ -2403,11 +2691,13 @@ def convert_markdown_to_html(template: str, link: str) -> str:
     return re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', template).replace("{link}", link)
 
 
+
+
 @loader.tds
 class YouTube_DLDMod(loader.Module):
     """Помогает скачивать видео с YouTube, TikTok и др. SponsorBlock вырезает рекламу, -s/-e берут только отрезок."""
 
-    __version__ = (3, 4, 6)
+    __version__ = (3, 4, 7)
 
     strings = {
         "name": "YouTube-DLD",
@@ -2415,7 +2705,7 @@ class YouTube_DLDMod(loader.Module):
         "youtube_posts_unsupported": EMOJI_WARN + " <b>Посты YouTube временно не поддерживаются.</b>",
         "default_downloading": "<b>Загружаю видео.</b>\n\n" + EMOJI_CLOCK + " <code>{eta}</code>",
         "default_downloading_simple": "<b>Загружаю видео.</b>",
-        "eta_unknown": "…",
+        "eta_unknown": "...",
         "default_error": "<b>Ошибка загрузки.</b>\n\n<code>{error}</code>",
         "too_long": "Видео длиннее {minutes} мин. Скачивание отменено — лимит меняется в .cfg YouTube-DLD (max_duration).",
         "cancelled": EMOJI_WARN + " <b>Загрузка отменена (.dlstop).</b>",
@@ -2427,7 +2717,7 @@ class YouTube_DLDMod(loader.Module):
         "default_channel": "<tg-emoji emoji-id=\"5886412370347036129\">👤</tg-emoji> Канал: <code>{channel}</code>",
         "downloading_audio": EMOJI_NOTE + " <b>Скачиваю аудио...</b>",
         "quality_downloading": EMOJI_DOWNLOAD + " <b>Качаю в улучшенном качестве...</b>\n\n<i>Займёт чуть дольше обычного.</i>",
-        "quality_compressing": EMOJI_COMPRESS + " <b>Сжимаю видео перед отправкой.</b>\n\n" + EMOJI_CLOCK + " <code>{eta}</code>",
+        "quality_compressing": EMOJI_COMPRESS + " <b>Сжимаю видео перед отправкой.</b>\n\n" + EMOJI_INFO + " <code>Осталось ≈ {eta}</code>",
         "queue_waiting": EMOJI_QUEUE + " <b>Видео в очереди({position})...</b>",
         "done_fallback": "Готово!",
         "extracting_audio": EMOJI_NOTE + " <b>Вырезаю звук из видео...</b>",
@@ -2489,7 +2779,7 @@ class YouTube_DLDMod(loader.Module):
         "sb_music_only_btn": "Только на music.youtube.com",
         "sb_back": "◀️ Назад",
         "sb_saved": "Сохранено",
-        "vo_translating": EMOJI_MIC + " <b>Перевожу озвучку.</b>\n\n" + EMOJI_CLOCK + " <code>{eta}</code>",
+        "vo_translating": EMOJI_MIC + " <b>Перевожу озвучку.</b>\n\n" + EMOJI_INFO + " <code>Осталось ≈ {eta}</code>",
         "vo_translating_simple": EMOJI_MIC + " <b>Перевожу озвучку.</b>",
         "vo_failed": EMOJI_WARN + " Озвучка не получилась: <code>{error}</code>\n\nОтправляю видео без перевода...",
         "cat_sponsor": "📢 Спонсор",
@@ -2507,7 +2797,7 @@ class YouTube_DLDMod(loader.Module):
         "youtube_posts_unsupported": EMOJI_WARN + " <b>YouTube posts are temporarily not supported.</b>",
         "default_downloading": "<b>Downloading the video.</b>\n\n" + EMOJI_CLOCK + " <code>{eta}</code>",
         "default_downloading_simple": "<b>Downloading the video.</b>",
-        "eta_unknown": "…",
+        "eta_unknown": "...",
         "default_error": "<b>Download failed.</b>\n\n<code>{error}</code>",
         "too_long": "The video is longer than {minutes} min. Download cancelled — the limit is set in .cfg YouTube-DLD (max_duration).",
         "cancelled": EMOJI_WARN + " <b>Download cancelled (.dlstop).</b>",
@@ -2519,7 +2809,7 @@ class YouTube_DLDMod(loader.Module):
         "default_channel": "<tg-emoji emoji-id=\"5886412370347036129\">👤</tg-emoji> Channel: <code>{channel}</code>",
         "downloading_audio": EMOJI_NOTE + " <b>Downloading audio...</b>",
         "quality_downloading": EMOJI_DOWNLOAD + " <b>Downloading in enhanced quality...</b>\n\n<i>Takes a bit longer than usual.</i>",
-        "quality_compressing": EMOJI_COMPRESS + " <b>Compressing the video before sending.</b>\n\n" + EMOJI_CLOCK + " <code>{eta}</code>",
+        "quality_compressing": EMOJI_COMPRESS + " <b>Compressing the video before sending.</b>\n\n" + EMOJI_INFO + " <code>≈ {eta} remaining</code>",
         "queue_waiting": EMOJI_QUEUE + " <b>Video queued ({position})...</b>",
         "done_fallback": "Done!",
         "extracting_audio": EMOJI_NOTE + " <b>Extracting audio from the video...</b>",
@@ -2581,7 +2871,7 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
         "sb_music_only_btn": "Only on music.youtube.com",
         "sb_back": "◀️ Back",
         "sb_saved": "Saved",
-        "vo_translating": EMOJI_MIC + " <b>Translating voice-over.</b>\n\n" + EMOJI_CLOCK + " <code>{eta}</code>",
+        "vo_translating": EMOJI_MIC + " <b>Translating voice-over.</b>\n\n" + EMOJI_INFO + " <code>≈ {eta} remaining</code>",
         "vo_translating_simple": EMOJI_MIC + " <b>Translating voice-over.</b>",
         "vo_failed": EMOJI_WARN + " Voice-over failed: <code>{error}</code>\n\nSending the video without translation...",
         "cat_sponsor": "📢 Sponsor",
@@ -2819,21 +3109,15 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
             loader.ConfigValue(
                 "youtube_cookies",
                 [],
-                EMOJI_COOKIE + " Куки в формате Netscape (ТЕКСТОМ!) — список: добавляй куки каждого сайта ОТДЕЛЬНЫМ "
-                "элементом («Добавить элемент»), не нужно склеивать всё в один текст. Поддерживаются YouTube, "
-                "Яндекс.Музыка, VK, Instagram, Twitter/X — определяются автоматически по содержимому, неважно в каком порядке "
-                "добавлены. «Удалить элемент» удаляет выбранный целиком (список покажет сырой вставленный текст, "
-                "не название сайта — так работает этот тип поля в Heroku).\n\n" +
-                EMOJI_WARN + " ВАЖНО: Если твой Heroku сервер во Франции/UK - экспортируй куки через VPN той же стране!\n\n"
-                "Как получить куки YouTube:\n"
-                "1. Подключись к VPN страны где твой сервер (не обязательно)\n"
-                "2. Открой приватное окно в браузере → залогинься на YouTube\n"
-                "3. Перейди на youtube.com/robots.txt\n"
-                "4. <a href='https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm'>Cookie-Editor</a> → Export → Netscape\n"
-                "5. СРАЗУ закрой окно\n"
-                "6. Добавь элементом весь текст из файла\n\n"
+                EMOJI_COOKIE + " Куки Netscape (ТЕКСТОМ!) — каждый сайт ОТДЕЛЬНЫМ элементом "
+                "(«Добавить элемент»). YouTube, Яндекс.Музыка, VK, Instagram, Twitter/X — "
+                "модуль сам оставит только нужные строки по доменам.\n\n"
+                "Как получить: Cookie-Editor → Export → Netscape "
+                "(youtube.com/robots.txt, music.yandex.ru/robots.txt, …).\n"
+                "Можно вставлять весь экспорт — лишнее срежется при сохранении.\n"
                 "Начинается с: # Netscape HTTP Cookie File",
-                validator=loader.validators.Series(validator=loader.validators.Hidden()),
+                validator=loader.validators.Series(validator=loader.validators.String()),
+                on_change=self._on_youtube_cookies_change,
             ),
             loader.ConfigValue(
                 "proxy",
@@ -2875,6 +3159,46 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
                 validator=loader.validators.Integer(minimum=0, maximum=100),
             ),
         )
+
+
+    def _on_youtube_cookies_change(self):
+        raw = self.config["youtube_cookies"]
+        if raw is None:
+            self.config["youtube_cookies"] = []
+            return
+        if isinstance(raw, str):
+            items = [raw]
+        else:
+            try:
+                items = list(raw)
+            except TypeError:
+                items = [str(raw)]
+        cleaned = []
+        seen = set()
+        for item in items:
+            text = item or ""
+            if not text.strip():
+                cleaned.append(text)
+                continue
+            c = clean_cookies_text(text)
+            if c is None:
+                cleaned.append(text)
+                continue
+            body_lines = [
+                ln for ln in c.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            if not body_lines:
+                cleaned.append(text)
+                continue
+            body = "\n".join(body_lines)
+            if body in seen:
+                continue
+            seen.add(body)
+            if not c.lstrip().startswith("#"):
+                c = "# Netscape HTTP Cookie File\n" + c
+            cleaned.append(c)
+        self.config["youtube_cookies"] = cleaned
 
     @loader.command()
     async def dvlist(self, message):
@@ -3063,7 +3387,7 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
             if is_instagram_link:
                 title_hint, channel_hint = None, None
             else:
-                cookies_cfg = clean_cookies_text("\n".join(self.config["youtube_cookies"]))
+                cookies_cfg = config_cookies_text(self.config["youtube_cookies"])
                 title_hint, channel_hint = await probe_title_channel(link, cookies_text=cookies_cfg)
                 if not title_hint:
                     og_title, og_desc = await fetch_og_preview(link)
@@ -3488,7 +3812,7 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
         cancel_event = threading.Event()
         self._register_active_job(resume_job_id, cancel_event, message.chat_id)
 
-        cookies = clean_cookies_text("\n".join(self.config["youtube_cookies"]))
+        cookies = config_cookies_text(self.config["youtube_cookies"])
         proxy = self.config["proxy"].strip() if self.config["proxy"] else None
         is_tiktok = "tiktok.com" in link.lower()
         is_instagram = "instagram.com" in link.lower()
@@ -3516,12 +3840,12 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
         def render_downloading_text():
             if progress["short_form"]:
                 return f"{EMOJI_DOWNLOAD} " + self.strings("default_downloading_simple")
-            return f"{EMOJI_DOWNLOAD} " + self.config["downloading_text"].replace(
-                "{attempt}", str(progress["attempt"])
-            ).replace(
-                "{method}", method_labels.get(progress["method"], progress["method"])
-            ).replace(
-                "{eta}", progress["eta"]
+            eta = progress.get("eta") or self.strings("eta_unknown")
+            if eta in ("…", "...", self.strings("eta_unknown")):
+                return f"{EMOJI_DOWNLOAD} " + self.strings("default_downloading_simple")
+            return (
+                f"{EMOJI_DOWNLOAD} <b>Загружаю видео.</b>\n\n"
+                f"{EMOJI_CLOCK} <code>{eta}</code>"
             )
 
         async def update_status(attempt, method_name):
@@ -3714,101 +4038,255 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
             if yandex_track_id or yandex_album_id or yandex_playlist:
                 try:
                     collection_title = None
+                    collection_artists = ""
+                    collection_cover = None
                     track_ids = []
                     if yandex_track_id:
                         track_ids = [yandex_track_id]
                     elif yandex_album_id:
-                        collection_title, track_ids = await fetch_yandex_album_tracks(
+                        collection_title, collection_artists, track_ids, collection_cover = await fetch_yandex_album_tracks(
                             yandex_album_id, cookies_text=cookies
                         )
                     else:
-                        collection_title, track_ids = await fetch_yandex_playlist_tracks(
+                        collection_title, collection_artists, track_ids, collection_cover = await fetch_yandex_playlist_tracks(
                             yandex_playlist[0], yandex_playlist[1], cookies_text=cookies
                         )
 
                     total_n = len(track_ids)
                     safe_link_attr = html_escaping.escape(link, quote=True)
+                    downloaded = []
+                    t0 = time.monotonic()
+
                     for idx, tid in enumerate(track_ids, 1):
-                        ym_path = ym_cover_path = None
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise DownloadCancelled()
                         try:
                             if total_n > 1:
+                                elapsed = time.monotonic() - t0
+                                if idx > 1 and elapsed > 0:
+                                    per = elapsed / (idx - 1)
+                                    eta_left = format_seconds(max(0, int(per * (total_n - idx + 1))))
+                                else:
+                                    eta_left = self.strings("eta_unknown")
                                 try:
                                     await status_msg.edit(
-                                        self.strings("playlist_progress")
-                                        .replace("{idx}", str(idx))
-                                        .replace("{total}", str(total_n))
-                                        .replace("{title}", collection_title or tid)
+                                        f"{EMOJI_NOTE} <b>Скачиваю {idx}/{total_n}</b>\n"
+                                        f"{EMOJI_CLOCK} <code>{eta_left}</code>\n"
+                                        f"<code>{html_escaping.escape(collection_title or tid)}</code>"
                                     )
                                 except Exception:
                                     pass
-                            (ym_path, ym_title, ym_artist, ym_album, ym_duration,
-                             ym_cover_bytes, ym_meta_debug) = await download_yandex_track_by_id(
-                                tid, utils.get_base_dir(), cookies_text=cookies, prefer_flac=raw_quality
-                            ) if not yandex_track_id else await download_yandex_music_track(
-                                link, utils.get_base_dir(), cookies_text=cookies, prefer_flac=raw_quality
-                            )
 
-                            used_flac = bool(ym_path) and ym_path.lower().endswith(".flac")
-                            info_line = (
-                                f"{ym_title} — {ym_artist}"
-                                if ym_artist and ym_artist != "Unknown Artist" else ym_title
-                            )
-                            pos_marker = f" ({idx}/{total_n})" if total_n > 1 else ""
-                            if used_flac:
-                                caption = (
-                                    f'{get_site_emoji_html(link)} <a href="{safe_link_attr}"><b>Аудио</b></a>'
-                                    f'<b>. Flac</b>{pos_marker}\n\n{info_line}'
+                            if yandex_track_id:
+                                (ym_path, ym_title, ym_artist, ym_album, ym_duration,
+                                 ym_cover_bytes, ym_meta_debug) = await download_yandex_music_track(
+                                    link, utils.get_base_dir(), cookies_text=cookies, prefer_flac=raw_quality
                                 )
                             else:
-                                caption_head = convert_markdown_to_html(self.config["music_response_text"], link)
-                                caption_head = caption_head.replace("{title}", "")
-                                caption_head = re.sub(r"<(\w+)>\s*</\1>\s*$", "", caption_head).rstrip()
-                                caption = f"{get_site_emoji_html(link)} {caption_head}{pos_marker}\n\n{info_line}"
-                            if collection_title and total_n > 1:
-                                caption += f"\n<code>{html_escaping.escape(collection_title)}</code>"
-                            if ym_duration:
-                                caption += f"\n{EMOJI_CLOCK} {format_seconds(ym_duration)}"
-
-                            audio_attributes = [DocumentAttributeAudio(
-                                duration=ym_duration or 0,
-                                title=ym_title,
-                                performer=ym_artist,
-                            )]
-                            if ym_cover_bytes:
-                                ym_cover_path = os.path.join(
-                                    utils.get_base_dir(), f"ymcover_{uuid.uuid4().hex[:8]}.jpg"
+                                (ym_path, ym_title, ym_artist, ym_album, ym_duration,
+                                 ym_cover_bytes, ym_meta_debug) = await download_yandex_track_by_id(
+                                    tid, utils.get_base_dir(), cookies_text=cookies, prefer_flac=raw_quality
                                 )
-                                async with aiofiles.open(ym_cover_path, "wb") as cf:
-                                    await cf.write(ym_cover_bytes)
 
-                            send_kwargs = dict(
-                                caption=caption, parse_mode="HTML", reply_to=reply or message,
-                                attributes=audio_attributes,
-                            )
-                            if ym_cover_path:
-                                send_kwargs["thumb"] = ym_cover_path
-                            try:
-                                await utils.answer_file(answer_target, ym_path, silent=True, **send_kwargs)
-                            except TypeError as silent_err:
-                                if "silent" not in str(silent_err):
-                                    raise
-                                await utils.answer_file(answer_target, ym_path, **send_kwargs)
-                        finally:
-                            for p in (ym_cover_path, ym_path):
+                            downloaded.append({
+                                "path": ym_path,
+                                "title": ym_title,
+                                "artist": ym_artist,
+                                "duration": ym_duration or 0,
+                                "track_cover_bytes": ym_cover_bytes if total_n == 1 else None,
+                                "flac": bool(ym_path) and ym_path.lower().endswith(".flac"),
+                                "ext": (os.path.splitext(ym_path)[1].lstrip(".") or "mp3"),
+                            })
+                        except DownloadCancelled:
+                            for item in downloaded:
+                                p = item.get("path")
                                 if p:
                                     try:
                                         os.remove(p)
                                     except Exception:
                                         pass
+                            raise
+                        except Exception as one_err:
+                            logger.warning(f"Yandex track {tid} failed: {one_err}")
+                            continue
+
+                    if not downloaded:
+                        raise ValueError("Не удалось скачать ни одного трека")
+
+                    if cancel_event is not None and cancel_event.is_set():
+                        for item in downloaded:
+                            p = item.get("path")
+                            if p:
+                                try:
+                                    os.remove(p)
+                                except Exception:
+                                    pass
+                        raise DownloadCancelled()
+
+                    coll_cover_path = None
+                    if collection_cover:
+                        coll_cover_path = os.path.join(
+                            utils.get_base_dir(), f"ymcover_{uuid.uuid4().hex[:8]}.jpg"
+                        )
+                        async with aiofiles.open(coll_cover_path, "wb") as cf:
+                            await cf.write(collection_cover)
+
+                    if len(downloaded) == 1:
+                        item = downloaded[0]
+                        info_line = (
+                            f"{item['title']} — {item['artist']}"
+                            if item['artist'] and item['artist'] != "Unknown Artist" else item['title']
+                        )
+                        if item["flac"]:
+                            caption = (
+                                f'{get_site_emoji_html(link)} <a href="{safe_link_attr}"><b>Аудио</b></a>'
+                                f'<b>. Flac</b>\n\n{info_line}'
+                            )
+                        else:
+                            caption_head = convert_markdown_to_html(self.config["music_response_text"], link)
+                            caption_head = caption_head.replace("{title}", "")
+                            caption_head = re.sub(r"<(\w+)>\s*</\1>\s*$", "", caption_head).rstrip()
+                            caption = f"{get_site_emoji_html(link)} {caption_head}\n\n{info_line}"
+                        if item["duration"]:
+                            caption += f"\n{EMOJI_CLOCK} {format_seconds(item['duration'])}"
+                        safe_name = sanitize_media_filename(item["title"])
+                        audio_attributes = [
+                            DocumentAttributeFilename(f"{safe_name}.{item['ext']}"),
+                            DocumentAttributeAudio(
+                                duration=item["duration"],
+                                title=item["title"],
+                                performer=item["artist"],
+                            ),
+                        ]
+                        thumb_path = None
+                        cover_bytes = item.get("track_cover_bytes") or collection_cover
+                        if cover_bytes:
+                            await _yandex_stamp_cover(item["path"], cover_bytes)
+                            thumb_path = os.path.join(
+                                utils.get_base_dir(), f"ymcover_{uuid.uuid4().hex[:8]}.jpg"
+                            )
+                            async with aiofiles.open(thumb_path, "wb") as cf:
+                                await cf.write(cover_bytes)
+                        send_kwargs = dict(
+                            caption=caption, parse_mode="HTML", reply_to=reply or message,
+                            attributes=audio_attributes,
+                        )
+                        if thumb_path:
+                            send_kwargs["thumb"] = thumb_path
+                        try:
+                            await utils.answer_file(answer_target, item["path"], silent=True, **send_kwargs)
+                        except TypeError as silent_err:
+                            if "silent" not in str(silent_err):
+                                raise
+                            await utils.answer_file(answer_target, item["path"], **send_kwargs)
+                        if thumb_path and thumb_path != coll_cover_path:
+                            try:
+                                os.remove(thumb_path)
+                            except Exception:
+                                pass
+                    else:
+                        n = len(downloaded)
+                        word = _ru_track_word(n)
+                        coll = html_escaping.escape(collection_title or "Плейлист")
+                        arts = html_escaping.escape(collection_artists or "")
+                        if not arts:
+                            from collections import Counter
+                            c = Counter(
+                                it["artist"] for it in downloaded
+                                if it.get("artist") and it["artist"] != "Unknown Artist"
+                            )
+                            arts = html_escaping.escape(c.most_common(1)[0][0]) if c else ""
+                        info_line = f"{coll} — {arts}" if arts else coll
+                        group_caption = (
+                            f'{get_site_emoji_html(link)} <a href="{safe_link_attr}"><b>Плейлист</b></a>. {n} {word}\n\n'
+                            f'{info_line}'
+                        )
+                        try:
+                            await status_msg.edit(f"{EMOJI_NOTE} <b>Отправляю {n} {word}...</b>")
+                        except Exception:
+                            pass
+
+                        if collection_cover:
+                            for item in downloaded:
+                                await _yandex_stamp_cover(item["path"], collection_cover)
+
+                        paths = [it["path"] for it in downloaded]
+                        attrs_list = []
+                        for item in downloaded:
+                            safe_name = sanitize_media_filename(item["title"])
+                            attrs_list.append([
+                                DocumentAttributeFilename(f"{safe_name}.{item['ext']}"),
+                                DocumentAttributeAudio(
+                                    duration=item["duration"],
+                                    title=item["title"],
+                                    performer=item["artist"] or None,
+                                ),
+                            ])
+
+                        album_items = [
+                            {
+                                "path": p,
+                                "attributes": a,
+                                "thumb": coll_cover_path,
+                                "caption": None,
+                            }
+                            for p, a in zip(paths, attrs_list)
+                        ]
+                        album_items[-1]["caption"] = group_caption
+
+                        reply_id = (reply or message).id
+                        chunks = [album_items[i:i + 10] for i in range(0, len(album_items), 10)]
+
+                        sent_so_far = 0
+                        for chunk in chunks:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise DownloadCancelled()
+                            await _send_audio_album(
+                                answer_target.client, answer_target.peer_id, chunk,
+                                reply_to_id=reply_id, silent=True,
+                            )
+                            sent_so_far += len(chunk)
+                            remaining = n - sent_so_far
+                            if remaining > 0:
+                                try:
+                                    await status_msg.edit(
+                                        f"{EMOJI_NOTE} <b>Отправлено {sent_so_far}, отправляю ещё "
+                                        f"{remaining} {_ru_track_word(remaining)}...</b>"
+                                    )
+                                except Exception:
+                                    pass
+
                     try:
                         await status_msg.delete()
                     except Exception:
                         pass
+                    if coll_cover_path:
+                        try:
+                            os.remove(coll_cover_path)
+                        except Exception:
+                            pass
+                    for item in downloaded:
+                        p = item.get("path")
+                        if p:
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+                except DownloadCancelled:
+                    try:
+                        await status_msg.edit(self.strings("cancelled"))
+                    except Exception:
+                        pass
                 except Exception as ym_err:
                     logger.warning(f"Yandex Music download failed: {ym_err}")
-                    error_msg = cookies_error_message(
-                        "Яндекс.Музыки", "music.yandex.ru/robots.txt", clean_error_text(ym_err),
-                    )
+                    detail = clean_error_text(ym_err, cookies_text=cookies, proxy=proxy)
+                    low = detail.lower()
+                    if any(x in low for x in ("куки", "cookie", "session_id", "нужны куки", "авторизац")):
+                        error_msg = cookies_error_message(
+                            "Яндекс.Музыки", "music.yandex.ru/robots.txt", detail,
+                        )
+                    else:
+                        error_msg = f"{EMOJI_WARN} <b>Яндекс.Музыка:</b>\n\n<code>{html_escaping.escape(detail)}</code>"
                     try:
                         await utils.answer(answer_target, error_msg)
                     except Exception:
@@ -4294,17 +4772,17 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
                 if is_instagram:
                     error_msg = cookies_error_message(
                         "Instagram", "instagram.com/robots.txt",
-                        clean_error_text(instagram_carousel_err or e),
+                        clean_error_text(instagram_carousel_err or e, cookies_text=cookies, proxy=proxy),
                     )
                 else:
                     error_msg = (
                         f"{EMOJI_CROSS} <b>Загрузка не удалась</b> (нужны куки).\n\n"
-                        f"<code>{clean_error_text(instagram_carousel_err or e)}</code>"
+                        f"<code>{clean_error_text(instagram_carousel_err or e, cookies_text=cookies, proxy=proxy)}</code>"
                     )
             elif twitter_needs_cookies:
-                error_msg = cookies_error_message("Twitter/X", "x.com/robots.txt", clean_error_text(e))
+                error_msg = cookies_error_message("Twitter/X", "x.com/robots.txt", clean_error_text(e, cookies_text=cookies, proxy=proxy))
             else:
-                error_msg = f"{EMOJI_WARN} " + self.config["error_text"].replace("{error}", clean_error_text(e))
+                error_msg = f"{EMOJI_WARN} " + self.config["error_text"].replace("{error}", clean_error_text(e, cookies_text=cookies, proxy=proxy))
 
             if saveasbot_eligible and is_instagram:
                 reply_target = reply or message
