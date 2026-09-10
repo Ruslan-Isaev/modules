@@ -3,7 +3,7 @@
 # meta pic: https://kappa.lol/21nHvy
 # requires: yt_dlp aiohttp aiofiles mutagen
 
-__version__ = (3, 4, 8)
+__version__ = (3, 4, 9)
 
 import yt_dlp
 import uuid
@@ -2004,6 +2004,22 @@ def _yandex_artists_line(obj):
     return ", ".join(names)
 
 
+def _yandex_playlist_debug_hint(result):
+    if not isinstance(result, dict):
+        return f" (result type={type(result).__name__})"
+    tracks_val = result.get("tracks")
+    parts = [
+        f"trackCount={result.get('trackCount')}",
+        f"tracks={'list[' + str(len(tracks_val)) + ']' if isinstance(tracks_val, list) else type(tracks_val).__name__}",
+    ]
+    if isinstance(tracks_val, list) and tracks_val and isinstance(tracks_val[0], dict):
+        parts.append(f"item_keys={sorted(tracks_val[0].keys())}")
+    parts.append(f"result_keys={sorted(result.keys())[:12]}")
+    if not result:
+        parts.append("raw=" + repr(result)[:300])
+    return " (" + ", ".join(parts) + ")"
+
+
 def _yandex_collect_track_ids(result):
     track_ids = []
     if not isinstance(result, dict):
@@ -2013,16 +2029,16 @@ def _yandex_collect_track_ids(result):
             if isinstance(t, dict):
                 tid = t.get("id") or t.get("realId")
                 if tid is not None:
-                    track_ids.append(str(tid))
+                    track_ids.append(str(tid).split(":")[0])
     if track_ids:
         return track_ids
     for t in (result.get("tracks") or []):
         if not isinstance(t, dict):
             continue
         track = t.get("track") if isinstance(t.get("track"), dict) else t
-        tid = track.get("id") or track.get("realId")
+        tid = track.get("id") or track.get("realId") or t.get("id") or t.get("trackId")
         if tid is not None:
-            track_ids.append(str(tid))
+            track_ids.append(str(tid).split(":")[0])
     return track_ids
 
 
@@ -2107,10 +2123,12 @@ async def fetch_yandex_playlist_tracks(user, kind, cookies_text=None):
             raise ValueError(
                 "Не удалось получить плейлист. Обновите куки music.yandex.ru (нужен Session_id)"
             )
-        result = data.get("result") or {}
+        result = data.get("result")
+        if not isinstance(result, dict) or not result:
+            result = data if isinstance(data, dict) else {}
         track_ids = _yandex_collect_track_ids(result)
         if not track_ids:
-            raise ValueError("В плейлисте нет треков")
+            raise ValueError("В плейлисте нет треков" + _yandex_playlist_debug_hint(result))
         title = result.get("title") or f"Playlist {kind}"
         owner = result.get("owner") or {}
         artists = owner.get("name") or owner.get("login") or ""
@@ -2127,10 +2145,12 @@ async def fetch_yandex_playlist_by_uuid(playlist_uuid, cookies_text=None):
             raise ValueError(
                 "Не удалось получить плейлист. Обновите куки music.yandex.ru (нужен Session_id)"
             )
-        result = data.get("result") or {}
+        result = data.get("result")
+        if not isinstance(result, dict) or not result:
+            result = data if isinstance(data, dict) else {}
         track_ids = _yandex_collect_track_ids(result)
         if not track_ids:
-            raise ValueError("В плейлисте нет треков")
+            raise ValueError("В плейлисте нет треков" + _yandex_playlist_debug_hint(result))
         title = result.get("title") or "Playlist"
         owner = result.get("owner") or {}
         artists = owner.get("name") or owner.get("login") or ""
@@ -2726,7 +2746,7 @@ def convert_markdown_to_html(template: str, link: str) -> str:
 class YouTube_DLDMod(loader.Module):
     """Помогает скачивать видео с YouTube, TikTok и др. SponsorBlock вырезает рекламу, -s/-e берут только отрезок."""
 
-    __version__ = (3, 4, 8)
+    __version__ = (3, 4, 10)
 
     strings = {
         "name": "YouTube-DLD",
