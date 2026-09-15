@@ -3,7 +3,7 @@
 # meta pic: https://kappa.lol/21nHvy
 # requires: yt_dlp aiohttp aiofiles mutagen
 
-__version__ = (3, 4, 9)
+__version__ = (3, 4, 10)
 
 import yt_dlp
 import uuid
@@ -232,6 +232,7 @@ def extract_video_link(text):
         r"(https?://)?(www\.)?dailymotion\.com/video/[^\s]+",
         r"(https?://)?(www\.)?twitch\.tv/(videos/|clip/|[^/]+$)[^\s]*",
         r"(https?://)?(www\.)?streamable\.com/[^\s]+",
+        r"(https?://)?(www\.)?rule34video\.com/videos?/[^\s]+",
         r"(https?://)?(music\.)?yandex\.(ru|com|by|kz|ua)/album/[^\s]+",
         r"(https?://)?(music\.)?yandex\.(ru|com|by|kz|ua)/track/[^\s]+",
         r"(https?://)?(music\.)?yandex\.(ru|com|by|kz|ua)/(users/[^\s]+/)?playlists/[^\s]+",
@@ -1163,7 +1164,7 @@ async function translateVideoUrl(videoUrl, responseLang, maxWaitSeconds) {
 }
 
 async function main() {
-  const [, , videoUrl, responseLang = "ru", maxWaitSeconds = "180"] = process.argv;
+  const [, , videoUrl, responseLang = "ru", maxWaitSeconds = "480"] = process.argv;
 
   if (!videoUrl) {
     console.log(JSON.stringify({ ok: false, error: "no_url" }));
@@ -1289,7 +1290,7 @@ async def ensure_node_version_ok(minimum=20):
         )
 
 
-async def get_translated_audio(video_url, response_lang="ru", max_wait_seconds=180, on_progress=None):
+async def get_translated_audio(video_url, response_lang="ru", max_wait_seconds=480, on_progress=None):
     script_path = await ensure_vot_bridge_ready()
 
     proc = await asyncio.create_subprocess_exec(
@@ -2746,7 +2747,7 @@ def convert_markdown_to_html(template: str, link: str) -> str:
 class YouTube_DLDMod(loader.Module):
     """Помогает скачивать видео с YouTube, TikTok и др. SponsorBlock вырезает рекламу, -s/-e берут только отрезок."""
 
-    __version__ = (3, 4, 10)
+    __version__ = (3, 4, 11)
 
     strings = {
         "name": "YouTube-DLD",
@@ -3551,6 +3552,24 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
             except Exception:
                 continue
         return None
+
+    @staticmethod
+    async def _format_chat_ref(client, cid, entity=None):
+        if entity is None:
+            entity = await YouTube_DLDMod._resolve_whitelist_entity(client, cid)
+        if entity is None:
+            return f"<code>{cid}</code>"
+
+        name = tl_utils.get_display_name(entity) or str(cid)
+        username = getattr(entity, "username", None)
+        if isinstance(entity, tl_types.User):
+            link_url = f"tg://user?id={entity.id}"
+        elif username:
+            link_url = f"https://t.me/{username}"
+        else:
+            link_url = f"https://t.me/c/{entity.id}"
+
+        return f'<a href="{link_url}">{name}</a> (<code>{cid}</code>)'
 
     @loader.command()
     async def dlwl(self, message):
@@ -4787,9 +4806,10 @@ Full list of supported sites — <a href="https://github.com/yt-dlp/yt-dlp/blob/
                         log_channel_id = logging.getLogger().handlers[0].get_logid_by_client(message.client.tg_id)
                         log_topic_id = None
 
+                    chat_ref = await self._format_chat_ref(message.client, message.chat_id, entity=message.chat)
                     log_text = (
                         f"{EMOJI_WARN} <b>YouTube-DLD: автозагрузка не смогла скачать ссылку</b>\n\n"
-                        f"Чат: <code>{message.chat_id}</code>\n"
+                        f"Чат: {chat_ref}\n"
                         f"Ссылка: <code>{link}</code>\n\n"
                         f"<code>{clean_error_text(e)}</code>"
                     )
